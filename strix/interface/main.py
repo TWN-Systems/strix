@@ -10,6 +10,7 @@ import os
 import shutil
 import sys
 from pathlib import Path
+from typing import Any
 
 import litellm
 from docker.errors import DockerException
@@ -331,6 +332,26 @@ Examples:
         ),
     )
 
+    parser.add_argument(
+        "-v",
+        "--verbose",
+        action="store_true",
+        help=(
+            "Enable verbose output showing real-time agent events "
+            "(iterations, LLM requests/responses, tool executions, etc.). "
+            "Best used with -n/--non-interactive mode."
+        ),
+    )
+
+    parser.add_argument(
+        "--debug",
+        action="store_true",
+        help=(
+            "Enable debug mode with full LiteLLM debug logging. "
+            "Shows detailed API request/response information."
+        ),
+    )
+
     args = parser.parse_args()
 
     # Require either --target or --scope
@@ -615,6 +636,20 @@ def main() -> None:
     # This is a safety check in case the flow changes
     if args.validate:
         return
+
+    # Enable debug mode if requested
+    if getattr(args, "debug", False):
+        console = Console()
+        console.print("[bold yellow]Debug mode enabled - showing full LiteLLM debug output[/]\n")
+        os.environ["STRIX_DEBUG"] = "true"
+        litellm._turn_on_debug()
+        logging.getLogger().setLevel(logging.DEBUG)
+
+    # Enable verbose mode via environment for CLI to pick up
+    if getattr(args, "verbose", False):
+        os.environ["STRIX_VERBOSE"] = "true"
+        # Verbose implies we want to see more logging too
+        logging.getLogger().setLevel(logging.INFO)
 
     check_docker_installed()
     pull_docker_image()

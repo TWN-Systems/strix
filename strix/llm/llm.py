@@ -1,5 +1,7 @@
+import asyncio
 import logging
 import os
+import time
 from dataclasses import dataclass
 from enum import Enum
 from fnmatch import fnmatch
@@ -24,6 +26,16 @@ from strix.tools import get_tools_prompt
 
 
 logger = logging.getLogger(__name__)
+
+
+def _get_tracer() -> Any:
+    """Get global tracer if available."""
+    try:
+        from strix.telemetry.tracer import get_global_tracer
+
+        return get_global_tracer()
+    except ImportError:
+        return None
 
 api_key = os.getenv("LLM_API_KEY")
 if api_key:
@@ -69,6 +81,20 @@ REASONING_EFFORT_PATTERNS: list[str] = [
     "claude-sonnet-4-5*",
     "claude-haiku-4-5*",
 ]
+
+# Retry configuration for transient errors
+MAX_RETRIES = 3
+INITIAL_RETRY_DELAY = 2.0  # seconds
+MAX_RETRY_DELAY = 16.0  # seconds
+
+# Errors that are transient and should be retried
+RETRYABLE_ERRORS = (
+    litellm.RateLimitError,
+    litellm.Timeout,
+    litellm.ServiceUnavailableError,
+    litellm.InternalServerError,
+    litellm.APIConnectionError,
+)
 
 
 def normalize_model_name(model: str) -> str:
@@ -289,86 +315,173 @@ class LLM:
         if identity_message:
             messages.append(identity_message)
 
+        # Compress history (creates new list, doesn't mutate input)
         compressed_history = list(self.memory_compressor.compress_history(conversation_history))
 
-        conversation_history.clear()
-        conversation_history.extend(compressed_history)
+        # Update caller's history in-place with compressed version
+        # Note: This is intentional - it keeps agent's state.messages compressed
+        if len(compressed_history) < len(conversation_history):
+            conversation_history.clear()
+            conversation_history.extend(compressed_history)
+
         messages.extend(compressed_history)
 
         cached_messages = self._prepare_cached_messages(messages)
 
-        try:
-            response = await self._make_request(cached_messages)
-            self._update_usage_stats(response)
+        # Emit LLM request event
+        tracer = _get_tracer()
+        request_id = None
+        start_time = time.time()
 
-            content = ""
-            if (
-                response.choices
-                and hasattr(response.choices[0], "message")
-                and response.choices[0].message
-            ):
-                content = getattr(response.choices[0].message, "content", "") or ""
-
-            content = _truncate_to_first_function(content)
-
-            if "</function>" in content:
-                function_end_index = content.find("</function>") + len("</function>")
-                content = content[:function_end_index]
-
-            tool_invocations = parse_tool_invocations(content)
-
-            return LLMResponse(
-                scan_id=scan_id,
-                step_number=step_number,
-                role=StepRole.AGENT,
-                content=content,
-                tool_invocations=tool_invocations if tool_invocations else None,
+        if tracer and self.agent_id:
+            request_id = tracer.log_llm_request(
+                agent_id=self.agent_id,
+                model=self.config.model_name,
             )
 
-        except litellm.RateLimitError as e:
-            raise LLMRequestFailedError("LLM request failed: Rate limit exceeded", str(e)) from e
-        except litellm.AuthenticationError as e:
-            raise LLMRequestFailedError("LLM request failed: Invalid API key", str(e)) from e
-        except litellm.NotFoundError as e:
-            raise LLMRequestFailedError("LLM request failed: Model not found", str(e)) from e
-        except litellm.ContextWindowExceededError as e:
-            raise LLMRequestFailedError("LLM request failed: Context too long", str(e)) from e
-        except litellm.ContentPolicyViolationError as e:
+        # Retry loop with exponential backoff for transient errors
+        last_error: Exception | None = None
+        retry_delay = INITIAL_RETRY_DELAY
+
+        for attempt in range(MAX_RETRIES + 1):
+            try:
+                response = await self._make_request(cached_messages)
+                self._update_usage_stats(response)
+
+                # Emit LLM response event
+                duration_ms = (time.time() - start_time) * 1000
+                if tracer and self.agent_id and request_id:
+                    tracer.log_llm_response(
+                        agent_id=self.agent_id,
+                        request_id=request_id,
+                        input_tokens=self._last_request_stats.input_tokens,
+                        output_tokens=self._last_request_stats.output_tokens,
+                        duration_ms=duration_ms,
+                        cost=self._last_request_stats.cost,
+                        cached_tokens=self._last_request_stats.cached_tokens,
+                    )
+
+                content = ""
+                if (
+                    response.choices
+                    and hasattr(response.choices[0], "message")
+                    and response.choices[0].message
+                ):
+                    content = getattr(response.choices[0].message, "content", "") or ""
+
+                content = _truncate_to_first_function(content)
+
+                if "</function>" in content:
+                    function_end_index = content.find("</function>") + len("</function>")
+                    content = content[:function_end_index]
+
+                tool_invocations = parse_tool_invocations(content)
+
+                return LLMResponse(
+                    scan_id=scan_id,
+                    step_number=step_number,
+                    role=StepRole.AGENT,
+                    content=content,
+                    tool_invocations=tool_invocations if tool_invocations else None,
+                )
+
+            except RETRYABLE_ERRORS as e:
+                last_error = e
+                error_type = type(e).__name__
+
+                if attempt < MAX_RETRIES:
+                    # Log retry attempt
+                    logger.warning(
+                        f"LLM request failed ({error_type}), retrying in {retry_delay}s "
+                        f"(attempt {attempt + 1}/{MAX_RETRIES}): {e}"
+                    )
+                    await asyncio.sleep(retry_delay)
+                    retry_delay = min(retry_delay * 2, MAX_RETRY_DELAY)
+                    continue
+
+                # All retries exhausted
+                self._emit_llm_error(
+                    tracer, request_id, start_time,
+                    f"{error_type} (after {MAX_RETRIES} retries)",
+                    error_type, str(e)
+                )
+                raise LLMRequestFailedError(
+                    f"LLM request failed: {error_type} (after {MAX_RETRIES} retries)",
+                    str(e)
+                ) from e
+
+            except (
+                litellm.AuthenticationError,
+                litellm.NotFoundError,
+                litellm.ContextWindowExceededError,
+                litellm.ContentPolicyViolationError,
+                litellm.BudgetExceededError,
+                litellm.UnsupportedParamsError,
+                litellm.InvalidRequestError,
+                litellm.BadRequestError,
+            ) as e:
+                # Non-retryable errors - fail immediately
+                error_type = type(e).__name__
+                error_msg = self._get_error_message(e)
+                self._emit_llm_error(tracer, request_id, start_time, error_msg, error_type, str(e))
+                raise LLMRequestFailedError(f"LLM request failed: {error_msg}", str(e)) from e
+
+            except Exception as e:
+                # Unknown errors - fail immediately
+                error_type = type(e).__name__
+                self._emit_llm_error(tracer, request_id, start_time, str(e), error_type, str(e))
+                raise LLMRequestFailedError(f"LLM request failed: {error_type}", str(e)) from e
+
+        # Should not reach here, but handle edge case
+        if last_error:
             raise LLMRequestFailedError(
-                "LLM request failed: Content policy violation", str(e)
-            ) from e
-        except litellm.ServiceUnavailableError as e:
-            raise LLMRequestFailedError("LLM request failed: Service unavailable", str(e)) from e
-        except litellm.Timeout as e:
-            raise LLMRequestFailedError("LLM request failed: Request timed out", str(e)) from e
-        except litellm.UnprocessableEntityError as e:
-            raise LLMRequestFailedError("LLM request failed: Unprocessable entity", str(e)) from e
-        except litellm.InternalServerError as e:
-            raise LLMRequestFailedError("LLM request failed: Internal server error", str(e)) from e
-        except litellm.APIConnectionError as e:
-            raise LLMRequestFailedError("LLM request failed: Connection error", str(e)) from e
-        except litellm.UnsupportedParamsError as e:
-            raise LLMRequestFailedError("LLM request failed: Unsupported parameters", str(e)) from e
-        except litellm.BudgetExceededError as e:
-            raise LLMRequestFailedError("LLM request failed: Budget exceeded", str(e)) from e
-        except litellm.APIResponseValidationError as e:
-            raise LLMRequestFailedError(
-                "LLM request failed: Response validation error", str(e)
-            ) from e
-        except litellm.JSONSchemaValidationError as e:
-            raise LLMRequestFailedError(
-                "LLM request failed: JSON schema validation error", str(e)
-            ) from e
-        except litellm.InvalidRequestError as e:
-            raise LLMRequestFailedError("LLM request failed: Invalid request", str(e)) from e
-        except litellm.BadRequestError as e:
-            raise LLMRequestFailedError("LLM request failed: Bad request", str(e)) from e
-        except litellm.APIError as e:
-            raise LLMRequestFailedError("LLM request failed: API error", str(e)) from e
-        except litellm.OpenAIError as e:
-            raise LLMRequestFailedError("LLM request failed: OpenAI error", str(e)) from e
-        except Exception as e:
-            raise LLMRequestFailedError(f"LLM request failed: {type(e).__name__}", str(e)) from e
+                f"LLM request failed after {MAX_RETRIES} retries",
+                str(last_error)
+            ) from last_error
+        raise LLMRequestFailedError("LLM request failed: Unknown error")
+
+    def _emit_llm_error(
+        self, tracer: Any, request_id: str | None, start_time: float, error: str,
+        error_type: str | None = None, details: str | None = None
+    ) -> None:
+        """Emit LLM error event to tracer with full details."""
+        if tracer and self.agent_id and request_id:
+            duration_ms = (time.time() - start_time) * 1000
+            # Build detailed error message
+            error_parts = [error]
+            if error_type:
+                error_parts.insert(0, f"[{error_type}]")
+            if details:
+                # Truncate very long details but keep useful info
+                if len(details) > 500:
+                    details = details[:500] + "..."
+                error_parts.append(f"\nDetails: {details}")
+
+            full_error = " ".join(error_parts) if error_type else error
+            if details:
+                full_error = f"{full_error}\nDetails: {details}"
+
+            tracer.log_llm_error(
+                agent_id=self.agent_id,
+                request_id=request_id,
+                error=full_error,
+                duration_ms=duration_ms,
+            )
+
+    def _get_error_message(self, error: Exception) -> str:
+        """Get human-readable error message for common LiteLLM errors."""
+        error_messages = {
+            "AuthenticationError": "Invalid API key",
+            "NotFoundError": "Model not found",
+            "ContextWindowExceededError": "Context too long",
+            "ContentPolicyViolationError": "Content policy violation",
+            "BudgetExceededError": "Budget exceeded",
+            "UnsupportedParamsError": "Unsupported parameters",
+            "InvalidRequestError": "Invalid request",
+            "BadRequestError": "Bad request",
+        }
+        error_type = type(error).__name__
+        return error_messages.get(error_type, error_type)
 
     @property
     def usage_stats(self) -> dict[str, dict[str, int | float]]:

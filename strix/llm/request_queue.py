@@ -1,6 +1,5 @@
 import asyncio
 import logging
-import threading
 import time
 from typing import Any
 
@@ -29,16 +28,25 @@ class LLMRequestQueue:
     def __init__(self, max_concurrent: int = 6, delay_between_requests: float = 1.0):
         self.max_concurrent = max_concurrent
         self.delay_between_requests = delay_between_requests
-        self._semaphore = threading.BoundedSemaphore(max_concurrent)
+        self._semaphore: asyncio.Semaphore | None = None
         self._last_request_time = 0.0
-        self._lock = threading.Lock()
+        self._lock: asyncio.Lock | None = None
+
+    def _get_semaphore(self) -> asyncio.Semaphore:
+        """Lazily create semaphore in the current event loop."""
+        if self._semaphore is None:
+            self._semaphore = asyncio.Semaphore(self.max_concurrent)
+        return self._semaphore
+
+    def _get_lock(self) -> asyncio.Lock:
+        """Lazily create lock in the current event loop."""
+        if self._lock is None:
+            self._lock = asyncio.Lock()
+        return self._lock
 
     async def make_request(self, completion_args: dict[str, Any]) -> ModelResponse:
-        try:
-            while not self._semaphore.acquire(timeout=0.2):
-                await asyncio.sleep(0.1)
-
-            with self._lock:
+        async with self._get_semaphore():
+            async with self._get_lock():
                 now = time.time()
                 time_since_last = now - self._last_request_time
                 sleep_needed = max(0, self.delay_between_requests - time_since_last)
@@ -48,8 +56,6 @@ class LLMRequestQueue:
                 await asyncio.sleep(sleep_needed)
 
             return await self._reliable_request(completion_args)
-        finally:
-            self._semaphore.release()
 
     @retry(  # type: ignore[misc]
         stop=stop_after_attempt(5),

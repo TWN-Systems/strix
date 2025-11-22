@@ -780,6 +780,7 @@ _PROXY_MANAGER: ProxyManager | None = None
 
 
 def get_proxy_manager() -> ProxyManager:
+    global _PROXY_MANAGER
     if _PROXY_MANAGER is None:
-        return ProxyManager()
+        _PROXY_MANAGER = ProxyManager()
     return _PROXY_MANAGER

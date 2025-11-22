@@ -5,6 +5,9 @@ from typing import Any, Literal
 from strix.tools.registry import register_tool
 
 
+# Thread lock for all global mutable state - use RLock to allow re-entrant locking
+_graph_lock = threading.RLock()
+
 _agent_graph: dict[str, Any] = {
     "nodes": {},
     "edges": [],
@@ -17,8 +20,6 @@ _agent_messages: dict[str, list[dict[str, Any]]] = {}
 _running_agents: dict[str, threading.Thread] = {}
 
 _agent_instances: dict[str, Any] = {}
-
-_agent_states: dict[str, Any] = {}
 
 
 def _run_agent_in_thread(
@@ -69,9 +70,8 @@ def _run_agent_in_thread(
 
         state.add_message("user", task_xml)
 
-        _agent_states[state.agent_id] = state
-
-        _agent_graph["nodes"][state.agent_id]["state"] = state.model_dump()
+        with _graph_lock:
+            _agent_graph["nodes"][state.agent_id]["state"] = state.model_dump()
 
         import asyncio
 
@@ -83,105 +83,108 @@ def _run_agent_in_thread(
             loop.close()
 
     except Exception as e:
-        _agent_graph["nodes"][state.agent_id]["status"] = "error"
-        _agent_graph["nodes"][state.agent_id]["finished_at"] = datetime.now(UTC).isoformat()
-        _agent_graph["nodes"][state.agent_id]["result"] = {"error": str(e)}
-        _running_agents.pop(state.agent_id, None)
-        _agent_instances.pop(state.agent_id, None)
+        with _graph_lock:
+            _agent_graph["nodes"][state.agent_id]["status"] = "error"
+            _agent_graph["nodes"][state.agent_id]["finished_at"] = datetime.now(UTC).isoformat()
+            _agent_graph["nodes"][state.agent_id]["result"] = {"error": str(e)}
+            _running_agents.pop(state.agent_id, None)
+            _agent_instances.pop(state.agent_id, None)
         raise
     else:
-        if state.stop_requested:
-            _agent_graph["nodes"][state.agent_id]["status"] = "stopped"
-        else:
-            _agent_graph["nodes"][state.agent_id]["status"] = "completed"
-        _agent_graph["nodes"][state.agent_id]["finished_at"] = datetime.now(UTC).isoformat()
-        _agent_graph["nodes"][state.agent_id]["result"] = result
-        _running_agents.pop(state.agent_id, None)
-        _agent_instances.pop(state.agent_id, None)
+        with _graph_lock:
+            if state.stop_requested:
+                _agent_graph["nodes"][state.agent_id]["status"] = "stopped"
+            else:
+                _agent_graph["nodes"][state.agent_id]["status"] = "completed"
+            _agent_graph["nodes"][state.agent_id]["finished_at"] = datetime.now(UTC).isoformat()
+            _agent_graph["nodes"][state.agent_id]["result"] = result
+            _running_agents.pop(state.agent_id, None)
+            _agent_instances.pop(state.agent_id, None)
 
         return {"result": result}
 
 
 @register_tool(sandbox_execution=False)
 def view_agent_graph(agent_state: Any) -> dict[str, Any]:
-    try:
-        structure_lines = ["=== AGENT GRAPH STRUCTURE ==="]
+    with _graph_lock:
+        try:
+            structure_lines = ["=== AGENT GRAPH STRUCTURE ==="]
 
-        def _build_tree(agent_id: str, depth: int = 0) -> None:
-            node = _agent_graph["nodes"][agent_id]
-            indent = "  " * depth
+            def _build_tree(agent_id: str, depth: int = 0) -> None:
+                node = _agent_graph["nodes"][agent_id]
+                indent = "  " * depth
 
-            you_indicator = " ← This is you" if agent_id == agent_state.agent_id else ""
+                you_indicator = " ← This is you" if agent_id == agent_state.agent_id else ""
 
-            structure_lines.append(f"{indent}* {node['name']} ({agent_id}){you_indicator}")
-            structure_lines.append(f"{indent}  Task: {node['task']}")
-            structure_lines.append(f"{indent}  Status: {node['status']}")
+                structure_lines.append(f"{indent}* {node['name']} ({agent_id}){you_indicator}")
+                structure_lines.append(f"{indent}  Task: {node['task']}")
+                structure_lines.append(f"{indent}  Status: {node['status']}")
 
-            children = [
-                edge["to"]
-                for edge in _agent_graph["edges"]
-                if edge["from"] == agent_id and edge["type"] == "delegation"
-            ]
+                children = [
+                    edge["to"]
+                    for edge in _agent_graph["edges"]
+                    if edge["from"] == agent_id and edge["type"] == "delegation"
+                ]
 
-            if children:
-                structure_lines.append(f"{indent}   Children:")
-                for child_id in children:
-                    _build_tree(child_id, depth + 2)
+                if children:
+                    structure_lines.append(f"{indent}   Children:")
+                    for child_id in children:
+                        _build_tree(child_id, depth + 2)
 
-        root_agent_id = _root_agent_id
-        if not root_agent_id and _agent_graph["nodes"]:
-            for agent_id, node in _agent_graph["nodes"].items():
-                if node.get("parent_id") is None:
-                    root_agent_id = agent_id
-                    break
-            if not root_agent_id:
-                root_agent_id = next(iter(_agent_graph["nodes"].keys()))
+            root_agent_id = _root_agent_id
+            if not root_agent_id and _agent_graph["nodes"]:
+                for agent_id, node in _agent_graph["nodes"].items():
+                    if node.get("parent_id") is None:
+                        root_agent_id = agent_id
+                        break
+                if not root_agent_id:
+                    root_agent_id = next(iter(_agent_graph["nodes"].keys()))
 
-        if root_agent_id and root_agent_id in _agent_graph["nodes"]:
-            _build_tree(root_agent_id)
+            if root_agent_id and root_agent_id in _agent_graph["nodes"]:
+                _build_tree(root_agent_id)
+            else:
+                structure_lines.append("No agents in the graph yet")
+
+            graph_structure = "\n".join(structure_lines)
+
+            total_nodes = len(_agent_graph["nodes"])
+            running_count = sum(
+                1 for node in _agent_graph["nodes"].values() if node["status"] == "running"
+            )
+            waiting_count = sum(
+                1 for node in _agent_graph["nodes"].values() if node["status"] == "waiting"
+            )
+            stopping_count = sum(
+                1 for node in _agent_graph["nodes"].values() if node["status"] == "stopping"
+            )
+            completed_count = sum(
+                1 for node in _agent_graph["nodes"].values() if node["status"] == "completed"
+            )
+            stopped_count = sum(
+                1 for node in _agent_graph["nodes"].values() if node["status"] == "stopped"
+            )
+            failed_count = sum(
+                1 for node in _agent_graph["nodes"].values() if node["status"] in ["failed", "error"]
+            )
+
+        except Exception as e:  # noqa: BLE001
+            return {
+                "error": f"Failed to view agent graph: {e}",
+                "graph_structure": "Error retrieving graph structure",
+            }
         else:
-            structure_lines.append("No agents in the graph yet")
-
-        graph_structure = "\n".join(structure_lines)
-
-        total_nodes = len(_agent_graph["nodes"])
-        running_count = sum(
-            1 for node in _agent_graph["nodes"].values() if node["status"] == "running"
-        )
-        waiting_count = sum(
-            1 for node in _agent_graph["nodes"].values() if node["status"] == "waiting"
-        )
-        stopping_count = sum(
-            1 for node in _agent_graph["nodes"].values() if node["status"] == "stopping"
-        )
-        completed_count = sum(
-            1 for node in _agent_graph["nodes"].values() if node["status"] == "completed"
-        )
-        stopped_count = sum(
-            1 for node in _agent_graph["nodes"].values() if node["status"] == "stopped"
-        )
-        failed_count = sum(
-            1 for node in _agent_graph["nodes"].values() if node["status"] in ["failed", "error"]
-        )
-
-    except Exception as e:  # noqa: BLE001
-        return {
-            "error": f"Failed to view agent graph: {e}",
-            "graph_structure": "Error retrieving graph structure",
-        }
-    else:
-        return {
-            "graph_structure": graph_structure,
-            "summary": {
-                "total_agents": total_nodes,
-                "running": running_count,
-                "waiting": waiting_count,
-                "stopping": stopping_count,
-                "completed": completed_count,
-                "stopped": stopped_count,
-                "failed": failed_count,
-            },
-        }
+            return {
+                "graph_structure": graph_structure,
+                "summary": {
+                    "total_agents": total_nodes,
+                    "running": running_count,
+                    "waiting": waiting_count,
+                    "stopping": stopping_count,
+                    "completed": completed_count,
+                    "stopped": stopped_count,
+                    "failed": failed_count,
+                },
+            }
 
 
 @register_tool(sandbox_execution=False)
@@ -267,16 +270,18 @@ def create_agent(
         if inherit_context:
             inherited_messages = agent_state.get_conversation_history()
 
-        _agent_instances[state.agent_id] = agent
+        # Atomic registration of agent instance and thread
+        with _graph_lock:
+            _agent_instances[state.agent_id] = agent
 
-        thread = threading.Thread(
-            target=_run_agent_in_thread,
-            args=(agent, state, inherited_messages),
-            daemon=True,
-            name=f"Agent-{name}-{state.agent_id}",
-        )
-        thread.start()
-        _running_agents[state.agent_id] = thread
+            thread = threading.Thread(
+                target=_run_agent_in_thread,
+                args=(agent, state, inherited_messages),
+                daemon=True,
+                name=f"Agent-{name}-{state.agent_id}",
+            )
+            thread.start()
+            _running_agents[state.agent_id] = thread
 
     except Exception as e:  # noqa: BLE001
         return {"success": False, "error": f"Failed to create agent: {e}", "agent_id": None}
@@ -303,51 +308,67 @@ def send_message_to_agent(
     priority: Literal["low", "normal", "high", "urgent"] = "normal",
 ) -> dict[str, Any]:
     try:
-        if target_agent_id not in _agent_graph["nodes"]:
-            return {
-                "success": False,
-                "error": f"Target agent '{target_agent_id}' not found in graph",
-                "message_id": None,
-            }
+        with _graph_lock:
+            if target_agent_id not in _agent_graph["nodes"]:
+                return {
+                    "success": False,
+                    "error": f"Target agent '{target_agent_id}' not found in graph",
+                    "message_id": None,
+                }
 
-        sender_id = agent_state.agent_id
+            sender_id = agent_state.agent_id
 
-        from uuid import uuid4
+            from uuid import uuid4
 
-        message_id = f"msg_{uuid4().hex[:8]}"
-        message_data = {
-            "id": message_id,
-            "from": sender_id,
-            "to": target_agent_id,
-            "content": message,
-            "message_type": message_type,
-            "priority": priority,
-            "timestamp": datetime.now(UTC).isoformat(),
-            "delivered": False,
-            "read": False,
-        }
-
-        if target_agent_id not in _agent_messages:
-            _agent_messages[target_agent_id] = []
-
-        _agent_messages[target_agent_id].append(message_data)
-
-        _agent_graph["edges"].append(
-            {
+            message_id = f"msg_{uuid4().hex[:8]}"
+            message_data = {
+                "id": message_id,
                 "from": sender_id,
                 "to": target_agent_id,
-                "type": "message",
-                "message_id": message_id,
+                "content": message,
                 "message_type": message_type,
                 "priority": priority,
-                "created_at": datetime.now(UTC).isoformat(),
+                "timestamp": datetime.now(UTC).isoformat(),
+                "delivered": False,
+                "read": False,
             }
-        )
 
-        message_data["delivered"] = True
+            if target_agent_id not in _agent_messages:
+                _agent_messages[target_agent_id] = []
 
-        target_name = _agent_graph["nodes"][target_agent_id]["name"]
-        sender_name = _agent_graph["nodes"][sender_id]["name"]
+            _agent_messages[target_agent_id].append(message_data)
+
+            _agent_graph["edges"].append(
+                {
+                    "from": sender_id,
+                    "to": target_agent_id,
+                    "type": "message",
+                    "message_id": message_id,
+                    "message_type": message_type,
+                    "priority": priority,
+                    "created_at": datetime.now(UTC).isoformat(),
+                }
+            )
+
+            message_data["delivered"] = True
+
+            target_name = _agent_graph["nodes"][target_agent_id]["name"]
+            sender_name = _agent_graph["nodes"][sender_id]["name"]
+            target_status = _agent_graph["nodes"][target_agent_id]["status"]
+
+        # Emit inter-agent message event (outside lock)
+        try:
+            from strix.telemetry.tracer import get_global_tracer
+
+            tracer = get_global_tracer()
+            if tracer:
+                tracer.log_agent_message_sent(
+                    from_agent_id=sender_id,
+                    to_agent_id=target_agent_id,
+                    message=message,
+                )
+        except (ImportError, AttributeError):
+            pass
 
         return {
             "success": True,
@@ -357,7 +378,7 @@ def send_message_to_agent(
             "target_agent": {
                 "id": target_agent_id,
                 "name": target_name,
-                "status": _agent_graph["nodes"][target_agent_id]["status"],
+                "status": target_status,
             },
         }
 
@@ -453,6 +474,20 @@ def agent_finish(
                     }
                 )
 
+                # Emit completion report message event
+                try:
+                    from strix.telemetry.tracer import get_global_tracer
+
+                    tracer = get_global_tracer()
+                    if tracer:
+                        tracer.log_agent_message_sent(
+                            from_agent_id=agent_id,
+                            to_agent_id=parent_id,
+                            message=f"[Completion Report] {result_summary}",
+                        )
+                except (ImportError, AttributeError):
+                    pass
+
                 parent_notified = True
 
         _running_agents.pop(agent_id, None)
@@ -498,10 +533,7 @@ def stop_agent(agent_id: str) -> dict[str, Any]:
                 "previous_status": agent_node["status"],
             }
 
-        if agent_id in _agent_states:
-            agent_state = _agent_states[agent_id]
-            agent_state.request_stop()
-
+        # Use _agent_instances to access agent state (single source of truth)
         if agent_id in _agent_instances:
             agent_instance = _agent_instances[agent_id]
             if hasattr(agent_instance, "state"):

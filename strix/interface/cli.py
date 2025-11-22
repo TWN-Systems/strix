@@ -1,7 +1,8 @@
 import atexit
+import os
 import signal
 import sys
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from rich.console import Console
 from rich.panel import Panel
@@ -9,9 +10,135 @@ from rich.text import Text
 
 from strix.agents.StrixAgent import StrixAgent
 from strix.llm.config import LLMConfig
-from strix.telemetry.tracer import Tracer, set_global_tracer
+from strix.telemetry.tracer import EventType, Tracer, TracerEvent, set_global_tracer
 
 from .utils import get_severity_color
+
+
+if TYPE_CHECKING:
+    pass
+
+
+def _format_event_for_cli(event: TracerEvent, console: Console) -> None:
+    """Format and print a tracer event to the CLI."""
+    agent_id = event.agent_id or "system"
+    # Truncate agent_id for display
+    agent_display = agent_id[:12] if len(agent_id) > 12 else agent_id
+    data = event.data
+
+    if event.event_type == EventType.AGENT_ITERATION:
+        iteration = data.get("iteration", 0)
+        max_iter = data.get("max_iterations", 0)
+        progress = data.get("progress_pct", 0)
+        console.print(
+            f"[dim cyan][{agent_display}][/] "
+            f"[bold]Iteration {iteration}/{max_iter}[/] ({progress}%)"
+        )
+
+    elif event.event_type == EventType.LLM_REQUEST:
+        model = data.get("model", "unknown")
+        console.print(
+            f"[dim cyan][{agent_display}][/] "
+            f"[yellow]→ LLM request[/] ({model})"
+        )
+
+    elif event.event_type == EventType.LLM_RESPONSE:
+        input_tok = data.get("input_tokens", 0)
+        output_tok = data.get("output_tokens", 0)
+        duration = data.get("duration_ms", 0)
+        cost = data.get("cost")
+        cached = data.get("cached_tokens", 0)
+
+        cost_str = f", ${cost:.4f}" if cost else ""
+        cache_str = f", {cached} cached" if cached > 0 else ""
+
+        console.print(
+            f"[dim cyan][{agent_display}][/] "
+            f"[green]← LLM response[/] "
+            f"({input_tok}+{output_tok} tokens, {duration:.0f}ms{cost_str}{cache_str})"
+        )
+
+    elif event.event_type == EventType.LLM_ERROR:
+        error = data.get("error", "unknown error")
+        duration = data.get("duration_ms")
+        duration_str = f" ({duration:.0f}ms)" if duration else ""
+        # Show full error with proper formatting
+        console.print(
+            f"[dim cyan][{agent_display}][/] "
+            f"[bold red]✗ LLM error{duration_str}:[/]"
+        )
+        # Print error details on separate lines for readability
+        for line in str(error).split("\n"):
+            if line.strip():
+                console.print(f"    [red]{line}[/]")
+
+    elif event.event_type == EventType.TOOL_START:
+        tool_name = data.get("tool_name", "unknown")
+        args = data.get("args", data.get("args_preview", {}))
+        # Truncate args for display
+        args_str = str(args)
+        if len(args_str) > 100:
+            args_str = args_str[:100] + "..."
+        console.print(
+            f"[dim cyan][{agent_display}][/] "
+            f"[bold magenta]→ {tool_name}[/] {args_str}"
+        )
+
+    elif event.event_type == EventType.TOOL_COMPLETE:
+        tool_name = data.get("tool_name", "unknown")
+        duration = data.get("duration_ms")
+        duration_str = f" ({duration:.0f}ms)" if duration else ""
+        console.print(
+            f"[dim cyan][{agent_display}][/] "
+            f"[green]✓ {tool_name} completed[/]{duration_str}"
+        )
+
+    elif event.event_type == EventType.TOOL_ERROR:
+        tool_name = data.get("tool_name", "unknown")
+        error = data.get("error", "unknown error")
+        duration = data.get("duration_ms")
+        duration_str = f" ({duration:.0f}ms)" if duration else ""
+        # Show full error with proper formatting
+        console.print(
+            f"[dim cyan][{agent_display}][/] "
+            f"[bold red]✗ {tool_name} error{duration_str}:[/]"
+        )
+        # Print error details on separate line for readability
+        for line in str(error).split("\n"):
+            console.print(f"    [red]{line}[/]")
+
+    elif event.event_type == EventType.AGENT_STATE_TRANSITION:
+        from_state = data.get("from_state", "?")
+        to_state = data.get("to_state", "?")
+        reason = data.get("reason", "")
+        reason_str = f" - {reason}" if reason else ""
+        console.print(
+            f"[dim cyan][{agent_display}][/] "
+            f"[blue]State: {from_state} → {to_state}[/]{reason_str}"
+        )
+
+    elif event.event_type == EventType.AGENT_MESSAGE_SENT:
+        to_agent = data.get("to_agent_id", "?")[:12]
+        msg_preview = data.get("message_preview", "")[:50]
+        console.print(
+            f"[dim cyan][{agent_display}][/] "
+            f"[yellow]📤 → {to_agent}:[/] {msg_preview}..."
+        )
+
+    elif event.event_type == EventType.AGENT_MESSAGE_RECEIVED:
+        from_agent = data.get("from_agent_id", "?")[:12]
+        msg_preview = data.get("message_preview", "")[:50]
+        console.print(
+            f"[dim cyan][{agent_display}][/] "
+            f"[green]📥 ← {from_agent}:[/] {msg_preview}..."
+        )
+
+    elif event.event_type == EventType.AGENT_CREATED:
+        name = data.get("name", "unknown")
+        console.print(
+            f"[dim cyan][{agent_display}][/] "
+            f"[bold green]+ Agent created:[/] {name}"
+        )
 
 
 async def run_cli(args: Any) -> None:  # noqa: PLR0915
@@ -119,6 +246,16 @@ async def run_cli(args: Any) -> None:  # noqa: PLR0915
         console.print()
 
     tracer.vulnerability_found_callback = display_vulnerability
+
+    # Enable real-time event streaming in verbose mode
+    verbose_mode = getattr(args, "verbose", False) or os.getenv("STRIX_VERBOSE", "").lower() == "true"
+    if verbose_mode:
+        console.print("[dim]Verbose mode enabled - showing all agent events[/]\n")
+
+        def event_callback(event: TracerEvent) -> None:
+            _format_event_for_cli(event, console)
+
+        tracer.event_callback = event_callback
 
     def cleanup_on_exit() -> None:
         tracer.cleanup()

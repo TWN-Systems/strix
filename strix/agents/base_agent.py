@@ -18,7 +18,11 @@ from strix.llm import LLM, LLMConfig, LLMRequestFailedError
 from strix.llm.utils import clean_content
 from strix.tools import process_tool_invocations
 
-from .state import AgentState
+from .state import AgentState, AgentStatus
+
+
+# Maximum consecutive empty responses before failing
+MAX_EMPTY_RESPONSES = 3
 
 
 logger = logging.getLogger(__name__)
@@ -131,8 +135,8 @@ class BaseAgent(metaclass=AgentMeta):
         }
         agents_graph_actions._agent_graph["nodes"][self.state.agent_id] = node
 
+        # Store agent instance only - state is accessible via agent.state
         agents_graph_actions._agent_instances[self.state.agent_id] = self
-        agents_graph_actions._agent_states[self.state.agent_id] = self.state
 
         if self.state.parent_id:
             agents_graph_actions._agent_graph["edges"].append(
@@ -151,6 +155,7 @@ class BaseAgent(metaclass=AgentMeta):
             self._current_task = None
 
     async def agent_loop(self, task: str) -> dict[str, Any]:  # noqa: PLR0912, PLR0915
+        """Main agent loop using status-based dispatch."""
         await self._initialize_sandbox_and_state(task)
 
         from strix.telemetry.tracer import get_global_tracer
@@ -158,50 +163,48 @@ class BaseAgent(metaclass=AgentMeta):
         tracer = get_global_tracer()
 
         while True:
+            # Check for inter-agent messages first
             self._check_agent_messages(self.state)
 
-            if self.state.is_waiting_for_input():
+            # Status-based dispatch
+            status = self.state.status
+
+            if status == AgentStatus.COMPLETED:
+                return self._finalize_agent(tracer, success=True)
+
+            if status == AgentStatus.FAILED:
+                return self._finalize_agent(tracer, success=False)
+
+            if status == AgentStatus.STOPPED:
+                if self.non_interactive:
+                    return self.state.final_result or {}
+                await self._enter_waiting_state(tracer, was_cancelled=True)
+                continue
+
+            if status in (AgentStatus.WAITING_FOR_MESSAGE, AgentStatus.WAITING_FOR_RECOVERY):
                 await self._wait_for_input()
                 continue
 
+            # RUNNING status - check if we should stop
             if self.state.should_stop():
                 if self.non_interactive:
                     return self.state.final_result or {}
                 await self._enter_waiting_state(tracer)
                 continue
 
-            if self.state.llm_failed:
-                await self._wait_for_input()
-                continue
-
+            # Execute an iteration
             self.state.increment_iteration()
 
-            if (
-                self.state.is_approaching_max_iterations()
-                and not self.state.max_iterations_warning_sent
-            ):
-                self.state.max_iterations_warning_sent = True
-                remaining = self.state.max_iterations - self.state.iteration
-                warning_msg = (
-                    f"URGENT: You are approaching the maximum iteration limit. "
-                    f"Current: {self.state.iteration}/{self.state.max_iterations} "
-                    f"({remaining} iterations remaining). "
-                    f"Please prioritize completing your required task(s) and calling "
-                    f"the appropriate finish tool (finish_scan for root agent, "
-                    f"agent_finish for sub-agents) as soon as possible."
+            # Emit iteration event
+            if tracer:
+                tracer.log_agent_iteration(
+                    agent_id=self.state.agent_id,
+                    iteration=self.state.iteration,
+                    max_iterations=self.state.max_iterations,
                 )
-                self.state.add_message("user", warning_msg)
 
-            if self.state.iteration == self.state.max_iterations - 3:
-                final_warning_msg = (
-                    "CRITICAL: You have only 3 iterations left! "
-                    "Your next message MUST be the tool call to the appropriate "
-                    "finish tool: finish_scan if you are the root agent, or "
-                    "agent_finish if you are a sub-agent. "
-                    "No other actions should be taken except finishing your work "
-                    "immediately."
-                )
-                self.state.add_message("user", final_warning_msg)
+            # Send warnings as we approach max iterations
+            self._check_iteration_warnings()
 
             try:
                 should_finish = await self._process_iteration(tracer)
@@ -221,37 +224,9 @@ class BaseAgent(metaclass=AgentMeta):
                 continue
 
             except LLMRequestFailedError as e:
-                error_msg = str(e)
-                error_details = getattr(e, "details", None)
-                self.state.add_error(error_msg)
-
+                self._handle_llm_error(e, tracer)
                 if self.non_interactive:
-                    self.state.set_completed({"success": False, "error": error_msg})
-                    if tracer:
-                        tracer.update_agent_status(self.state.agent_id, "failed", error_msg)
-                        if error_details:
-                            tracer.log_tool_execution_start(
-                                self.state.agent_id,
-                                "llm_error_details",
-                                {"error": error_msg, "details": error_details},
-                            )
-                            tracer.update_tool_execution(
-                                tracer._next_execution_id - 1, "failed", error_details
-                            )
-                    return {"success": False, "error": error_msg}
-
-                self.state.enter_waiting_state(llm_failed=True)
-                if tracer:
-                    tracer.update_agent_status(self.state.agent_id, "llm_failed", error_msg)
-                    if error_details:
-                        tracer.log_tool_execution_start(
-                            self.state.agent_id,
-                            "llm_error_details",
-                            {"error": error_msg, "details": error_details},
-                        )
-                        tracer.update_tool_execution(
-                            tracer._next_execution_id - 1, "failed", error_details
-                        )
+                    return {"success": False, "error": str(e)}
                 continue
 
             except (RuntimeError, ValueError, TypeError) as e:
@@ -263,6 +238,65 @@ class BaseAgent(metaclass=AgentMeta):
                         raise
                     await self._enter_waiting_state(tracer, error_occurred=True)
                     continue
+
+    def _finalize_agent(self, tracer: Optional["Tracer"], success: bool) -> dict[str, Any]:
+        """Finalize agent and return result."""
+        if tracer:
+            status_str = "completed" if success else "failed"
+            tracer.update_agent_status(self.state.agent_id, status_str, self.state.failure_reason)
+        return self.state.final_result or {"success": success}
+
+    def _check_iteration_warnings(self) -> None:
+        """Send warnings as agent approaches max iterations."""
+        if (
+            self.state.is_approaching_max_iterations()
+            and not self.state.max_iterations_warning_sent
+        ):
+            self.state.max_iterations_warning_sent = True
+            remaining = self.state.max_iterations - self.state.iteration
+            warning_msg = (
+                f"URGENT: You are approaching the maximum iteration limit. "
+                f"Current: {self.state.iteration}/{self.state.max_iterations} "
+                f"({remaining} iterations remaining). "
+                f"Please prioritize completing your required task(s) and calling "
+                f"the appropriate finish tool (finish_scan for root agent, "
+                f"agent_finish for sub-agents) as soon as possible."
+            )
+            self.state.add_message("user", warning_msg)
+
+        if self.state.iteration == self.state.max_iterations - 3:
+            final_warning_msg = (
+                "CRITICAL: You have only 3 iterations left! "
+                "Your next message MUST be the tool call to the appropriate "
+                "finish tool: finish_scan if you are the root agent, or "
+                "agent_finish if you are a sub-agent. "
+                "No other actions should be taken except finishing your work "
+                "immediately."
+            )
+            self.state.add_message("user", final_warning_msg)
+
+    def _handle_llm_error(self, e: LLMRequestFailedError, tracer: Optional["Tracer"]) -> None:
+        """Handle LLM request failure."""
+        error_msg = str(e)
+        error_details = getattr(e, "details", None)
+        self.state.add_error(error_msg)
+
+        if self.non_interactive:
+            self.state.set_failed(error_msg)
+        else:
+            self.state.enter_waiting_state(llm_failed=True)
+
+        if tracer:
+            tracer.update_agent_status(self.state.agent_id, "llm_failed", error_msg)
+            if error_details:
+                tracer.log_tool_execution_start(
+                    self.state.agent_id,
+                    "llm_error_details",
+                    {"error": error_msg, "details": error_details},
+                )
+                tracer.update_tool_execution(
+                    tracer._next_execution_id - 1, "failed", error_details
+                )
 
     async def _wait_for_input(self) -> None:
         import asyncio
@@ -296,17 +330,34 @@ class BaseAgent(metaclass=AgentMeta):
         error_occurred: bool = False,
         was_cancelled: bool = False,
     ) -> None:
+        old_state = "running"
         self.state.enter_waiting_state()
 
         if tracer:
             if task_completed:
+                new_state = "completed"
+                reason = "Task completed successfully"
                 tracer.update_agent_status(self.state.agent_id, "completed")
             elif error_occurred:
+                new_state = "error"
+                reason = "An error occurred"
                 tracer.update_agent_status(self.state.agent_id, "error")
             elif was_cancelled:
+                new_state = "stopped"
+                reason = "Execution cancelled by user"
                 tracer.update_agent_status(self.state.agent_id, "stopped")
             else:
+                new_state = "waiting"
+                reason = "Execution paused"
                 tracer.update_agent_status(self.state.agent_id, "stopped")
+
+            # Emit state transition event
+            tracer.log_agent_state_transition(
+                agent_id=self.state.agent_id,
+                from_state=old_state,
+                to_state=new_state,
+                reason=reason,
+            )
 
         if task_completed:
             self.state.add_message(
@@ -356,7 +407,23 @@ class BaseAgent(metaclass=AgentMeta):
         content_stripped = (response.content or "").strip()
 
         if not content_stripped:
+            # Track consecutive empty responses
+            self.state.consecutive_empty_responses += 1
+
+            if self.state.consecutive_empty_responses >= MAX_EMPTY_RESPONSES:
+                # Fail after too many empty responses
+                error_msg = (
+                    f"Agent failed: {MAX_EMPTY_RESPONSES} consecutive empty responses. "
+                    "The LLM is not responding properly."
+                )
+                logger.error(error_msg)
+                self.state.set_failed(error_msg)
+                if tracer:
+                    tracer.update_agent_status(self.state.agent_id, "failed", error_msg)
+                return True  # Signal to exit loop
+
             corrective_message = (
+                f"WARNING: Empty response ({self.state.consecutive_empty_responses}/{MAX_EMPTY_RESPONSES}). "
                 "You MUST NOT respond with empty messages. "
                 "If you currently have nothing to do or say, use an appropriate tool instead:\n"
                 "- Use agents_graph_actions.wait_for_message to wait for messages "
@@ -369,6 +436,8 @@ class BaseAgent(metaclass=AgentMeta):
             self.state.add_message("user", corrective_message)
             return False
 
+        # Reset empty response counter on successful response
+        self.state.consecutive_empty_responses = 0
         self.state.add_message("assistant", response.content)
         if tracer:
             tracer.log_chat_message(

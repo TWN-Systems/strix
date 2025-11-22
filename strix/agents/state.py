@@ -1,5 +1,6 @@
 import uuid
 from datetime import UTC, datetime
+from enum import Enum
 from typing import Any
 
 from pydantic import BaseModel, Field
@@ -7,6 +8,17 @@ from pydantic import BaseModel, Field
 
 def _generate_agent_id() -> str:
     return f"agent_{uuid.uuid4().hex[:8]}"
+
+
+class AgentStatus(Enum):
+    """Explicit agent status - single source of truth for agent state."""
+
+    RUNNING = "running"
+    WAITING_FOR_MESSAGE = "waiting_for_message"
+    WAITING_FOR_RECOVERY = "waiting_for_recovery"  # LLM retry pending
+    COMPLETED = "completed"
+    FAILED = "failed"
+    STOPPED = "stopped"
 
 
 class AgentState(BaseModel):
@@ -21,13 +33,15 @@ class AgentState(BaseModel):
     task: str = ""
     iteration: int = 0
     max_iterations: int = 300
-    completed: bool = False
-    stop_requested: bool = False
-    waiting_for_input: bool = False
-    llm_failed: bool = False
+    max_wait_seconds: int = 300  # 5 minutes default, always-on timeout
+
+    # Single status field replaces: completed, stop_requested, waiting_for_input, llm_failed
+    status: AgentStatus = AgentStatus.RUNNING
     waiting_start_time: datetime | None = None
     final_result: dict[str, Any] | None = None
+    failure_reason: str | None = None  # Reason for FAILED status
     max_iterations_warning_sent: bool = False
+    consecutive_empty_responses: int = 0  # Track empty LLM responses
 
     messages: list[dict[str, Any]] = Field(default_factory=list)
     context: dict[str, Any] = Field(default_factory=dict)
@@ -75,32 +89,46 @@ class AgentState(BaseModel):
         self.last_updated = datetime.now(UTC).isoformat()
 
     def set_completed(self, final_result: dict[str, Any] | None = None) -> None:
-        self.completed = True
+        self.status = AgentStatus.COMPLETED
         self.final_result = final_result
+        self.waiting_start_time = None
+        self.last_updated = datetime.now(UTC).isoformat()
+
+    def set_failed(self, reason: str) -> None:
+        """Mark agent as failed with a reason."""
+        self.status = AgentStatus.FAILED
+        self.failure_reason = reason
+        self.waiting_start_time = None
         self.last_updated = datetime.now(UTC).isoformat()
 
     def request_stop(self) -> None:
-        self.stop_requested = True
+        self.status = AgentStatus.STOPPED
+        self.waiting_start_time = None
         self.last_updated = datetime.now(UTC).isoformat()
 
     def should_stop(self) -> bool:
-        return self.stop_requested or self.completed or self.has_reached_max_iterations()
+        """Check if agent should exit its loop."""
+        return (
+            self.status in (AgentStatus.COMPLETED, AgentStatus.FAILED, AgentStatus.STOPPED)
+            or self.has_reached_max_iterations()
+        )
 
     def is_waiting_for_input(self) -> bool:
-        return self.waiting_for_input
+        return self.status in (AgentStatus.WAITING_FOR_MESSAGE, AgentStatus.WAITING_FOR_RECOVERY)
 
     def enter_waiting_state(self, llm_failed: bool = False) -> None:
-        self.waiting_for_input = True
+        if llm_failed:
+            self.status = AgentStatus.WAITING_FOR_RECOVERY
+        else:
+            self.status = AgentStatus.WAITING_FOR_MESSAGE
         self.waiting_start_time = datetime.now(UTC)
-        self.llm_failed = llm_failed
         self.last_updated = datetime.now(UTC).isoformat()
 
     def resume_from_waiting(self, new_task: str | None = None) -> None:
-        self.waiting_for_input = False
+        self.status = AgentStatus.RUNNING
         self.waiting_start_time = None
-        self.stop_requested = False
-        self.completed = False
-        self.llm_failed = False
+        self.failure_reason = None
+        self.consecutive_empty_responses = 0
         if new_task:
             self.task = new_task
         self.last_updated = datetime.now(UTC).isoformat()
@@ -112,19 +140,29 @@ class AgentState(BaseModel):
         return self.iteration >= int(self.max_iterations * threshold)
 
     def has_waiting_timeout(self) -> bool:
-        if not self.waiting_for_input or not self.waiting_start_time:
-            return False
-
-        if (
-            self.stop_requested
-            or self.llm_failed
-            or self.completed
-            or self.has_reached_max_iterations()
-        ):
+        """Check if waiting state has exceeded max_wait_seconds. Always-on timeout."""
+        if not self.is_waiting_for_input() or not self.waiting_start_time:
             return False
 
         elapsed = (datetime.now(UTC) - self.waiting_start_time).total_seconds()
-        return elapsed > 600
+        return elapsed > self.max_wait_seconds
+
+    # Backward compatibility properties
+    @property
+    def completed(self) -> bool:
+        return self.status == AgentStatus.COMPLETED
+
+    @property
+    def stop_requested(self) -> bool:
+        return self.status == AgentStatus.STOPPED
+
+    @property
+    def waiting_for_input(self) -> bool:
+        return self.is_waiting_for_input()
+
+    @property
+    def llm_failed(self) -> bool:
+        return self.status == AgentStatus.WAITING_FOR_RECOVERY
 
     def has_empty_last_messages(self, count: int = 3) -> bool:
         if len(self.messages) < count:
@@ -152,7 +190,9 @@ class AgentState(BaseModel):
             "task": self.task,
             "iteration": self.iteration,
             "max_iterations": self.max_iterations,
+            "status": self.status.value,
             "completed": self.completed,
+            "failure_reason": self.failure_reason,
             "final_result": self.final_result,
             "start_time": self.start_time,
             "last_updated": self.last_updated,

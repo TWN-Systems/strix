@@ -1,3 +1,5 @@
+import os
+
 import litellm
 
 from .config import LLMConfig
@@ -10,6 +12,9 @@ __all__ = [
     "LLMRequestFailedError",
 ]
 
-litellm._logging._disable_debugging()
+# Only disable debugging if not in debug mode
+# Debug mode is enabled via --debug flag or STRIX_DEBUG env var
+if os.getenv("STRIX_DEBUG", "").lower() != "true":
+    litellm._logging._disable_debugging()
 
 litellm.drop_params = True

@@ -1,8 +1,14 @@
 import inspect
 import os
+import time
+import traceback
 from typing import Any
 
 import httpx
+
+
+# Sandbox tool execution timeout (2 minutes)
+SANDBOX_TIMEOUT = httpx.Timeout(120.0, connect=10.0)
 
 
 if os.getenv("STRIX_SANDBOX_MODE", "false").lower() == "false":
@@ -63,16 +69,20 @@ async def _execute_tool_in_sandbox(tool_name: str, agent_state: Any, **kwargs: A
         "Content-Type": "application/json",
     }
 
-    async with httpx.AsyncClient(trust_env=False) as client:
+    async with httpx.AsyncClient(trust_env=False, timeout=SANDBOX_TIMEOUT) as client:
         try:
             response = await client.post(
-                request_url, json=request_data, headers=headers, timeout=None
+                request_url, json=request_data, headers=headers
             )
             response.raise_for_status()
             response_data = response.json()
             if response_data.get("error"):
                 raise RuntimeError(f"Sandbox execution error: {response_data['error']}")
             return response_data.get("result")
+        except httpx.TimeoutException as e:
+            raise RuntimeError(
+                f"Tool execution timed out after {SANDBOX_TIMEOUT.read}s: {tool_name}"
+            ) from e
         except httpx.HTTPStatusError as e:
             if e.response.status_code == 401:
                 raise RuntimeError("Authentication failed: Invalid or missing sandbox token") from e
@@ -219,12 +229,16 @@ async def _execute_single_tool(
     args = tool_inv.get("args", {})
     execution_id = None
     should_agent_finish = False
+    start_time = time.time()
 
     if tracer:
         execution_id = tracer.log_tool_execution_start(agent_id, tool_name, args)
+        # Emit TOOL_START event for real-time visibility
+        _emit_tool_start_event(tracer, agent_id, tool_name, args)
 
     try:
         result = await execute_tool_invocation(tool_inv, agent_state)
+        duration_ms = (time.time() - start_time) * 1000
 
         is_error, error_payload = _check_error_result(result)
 
@@ -240,14 +254,96 @@ async def _execute_single_tool(
 
         _update_tracer_with_result(tracer, execution_id, is_error, result, error_payload)
 
+        # Emit completion or error event for real-time visibility
+        if tracer:
+            if is_error:
+                _emit_tool_error_event(tracer, agent_id, tool_name, error_payload, duration_ms)
+            else:
+                _emit_tool_complete_event(tracer, agent_id, tool_name, result, duration_ms)
+
     except (ConnectionError, RuntimeError, ValueError, TypeError, OSError) as e:
+        duration_ms = (time.time() - start_time) * 1000
         error_msg = str(e)
+        error_type = type(e).__name__
+        stack_trace = traceback.format_exc()
+
         if tracer and execution_id:
             tracer.update_tool_execution(execution_id, "error", error_msg)
+
+        # Emit detailed error event for real-time visibility
+        if tracer:
+            _emit_tool_error_event(
+                tracer, agent_id, tool_name,
+                {"error": error_msg, "error_type": error_type, "stack_trace": stack_trace},
+                duration_ms
+            )
         raise
 
     observation_xml, images = _format_tool_result(tool_name, result)
     return observation_xml, images, should_agent_finish
+
+
+def _emit_tool_start_event(
+    tracer: Any, agent_id: str, tool_name: str, args: dict[str, Any]
+) -> None:
+    """Emit TOOL_START event to the tracer event stream."""
+    try:
+        from strix.telemetry.tracer import EventType
+
+        tracer.log_tool_event(
+            agent_id=agent_id,
+            tool_name=tool_name,
+            event_type=EventType.TOOL_START,
+            args=args,
+        )
+    except (ImportError, AttributeError):
+        pass
+
+
+def _emit_tool_complete_event(
+    tracer: Any, agent_id: str, tool_name: str, result: Any, duration_ms: float
+) -> None:
+    """Emit TOOL_COMPLETE event to the tracer event stream."""
+    try:
+        from strix.telemetry.tracer import EventType
+
+        tracer.log_tool_event(
+            agent_id=agent_id,
+            tool_name=tool_name,
+            event_type=EventType.TOOL_COMPLETE,
+            result=result,
+            duration_ms=duration_ms,
+        )
+    except (ImportError, AttributeError):
+        pass
+
+
+def _emit_tool_error_event(
+    tracer: Any, agent_id: str, tool_name: str, error: Any, duration_ms: float
+) -> None:
+    """Emit TOOL_ERROR event to the tracer event stream."""
+    try:
+        from strix.telemetry.tracer import EventType
+
+        # Extract detailed error info
+        if isinstance(error, dict):
+            error_str = error.get("error", str(error))
+            error_type = error.get("error_type", "UnknownError")
+            stack_trace = error.get("stack_trace")
+        else:
+            error_str = str(error)
+            error_type = "Error"
+            stack_trace = None
+
+        tracer.log_tool_event(
+            agent_id=agent_id,
+            tool_name=tool_name,
+            event_type=EventType.TOOL_ERROR,
+            error=f"[{error_type}] {error_str}",
+            duration_ms=duration_ms,
+        )
+    except (ImportError, AttributeError):
+        pass
 
 
 def _get_tracer_and_agent_id(agent_state: Any | None) -> tuple[Any | None, str]:

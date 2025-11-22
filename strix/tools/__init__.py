@@ -32,6 +32,7 @@ if not SANDBOX_MODE:
     from .file_edit import *  # noqa: F403
     from .finish import *  # noqa: F403
     from .notes import *  # noqa: F403
+    from .progress import *  # noqa: F403
     from .proxy import *  # noqa: F403
     from .python import *  # noqa: F403
     from .reporting import *  # noqa: F403

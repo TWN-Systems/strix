@@ -30,12 +30,12 @@ networks:
     description: "Ceph/storage cluster network"
 
 targets:
-  # Proxmox nodes
+  # Proxmox node on management network
   - host: "10.0.101.2"
-    name: "pve-node-01"
+    name: "pve-mgmt"
     type: "infrastructure"
     network: "Proxmox Management"
-    ports: [22, 8006, 3128, 5900]  # VNC starts at 5900
+    ports: [22, 8006, 3128, 5900]
     services:
       - port: 8006
         service: "proxmox-ve"
@@ -49,32 +49,41 @@ targets:
     tags: ["hypervisor", "cluster-master", "critical"]
     modules: ["proxmox_ve"]
 
-  - host: "10.0.101.3"
+  # Proxmox cluster nodes on VM network
+  - host: "10.0.102.2"
+    name: "pve-node-01"
+    type: "infrastructure"
+    network: "VM Network"
+    ports: [22, 8006, 3128]
+    services:
+      - port: 8006
+        service: "proxmox-ve"
+        version: "8.x"
+    tags: ["hypervisor", "cluster-member", "critical"]
+    modules: ["proxmox_ve"]
+
+  - host: "10.0.102.3"
     name: "pve-node-02"
     type: "infrastructure"
-    network: "Proxmox Management"
+    network: "VM Network"
     ports: [22, 8006, 3128]
-    tags: ["hypervisor", "cluster-member"]
+    services:
+      - port: 8006
+        service: "proxmox-ve"
+        version: "8.x"
+    tags: ["hypervisor", "cluster-member", "critical"]
     modules: ["proxmox_ve"]
 
-  - host: "10.0.101.4"
+  - host: "10.0.102.4"
     name: "pve-node-03"
     type: "infrastructure"
-    network: "Proxmox Management"
+    network: "VM Network"
     ports: [22, 8006, 3128]
-    tags: ["hypervisor", "cluster-member"]
-    modules: ["proxmox_ve"]
-
-  # PBS (Proxmox Backup Server) if present
-  - host: "10.0.101.10"
-    name: "pbs-backup-01"
-    type: "infrastructure"
-    network: "Proxmox Management"
-    ports: [22, 8007]
     services:
-      - port: 8007
-        service: "proxmox-backup"
-    tags: ["backup", "critical"]
+      - port: 8006
+        service: "proxmox-ve"
+        version: "8.x"
+    tags: ["hypervisor", "cluster-member", "critical"]
     modules: ["proxmox_ve"]
 
 exclusions:

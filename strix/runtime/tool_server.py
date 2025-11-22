@@ -65,19 +65,37 @@ class ToolExecutionResponse(BaseModel):
     error: str | None = None
 
 
+QUEUE_TIMEOUT = 120  # 2 minutes timeout for queue operations
+
+
 def agent_worker(_agent_id: str, request_queue: Queue[Any], response_queue: Queue[Any]) -> None:
-    null_handler = logging.NullHandler()
+    import os
+    from pathlib import Path
+    from queue import Empty
+
+    # Configure file-based logging for worker process (instead of suppressing)
+    log_dir = Path("/tmp/strix_workers")
+    log_dir.mkdir(exist_ok=True)
+    log_file = log_dir / f"worker_{os.getpid()}.log"
+
+    file_handler = logging.FileHandler(log_file)
+    file_handler.setLevel(logging.WARNING)
+    file_handler.setFormatter(logging.Formatter("%(asctime)s - %(name)s - %(levelname)s - %(message)s"))
 
     root_logger = logging.getLogger()
-    root_logger.handlers = [null_handler]
-    root_logger.setLevel(logging.CRITICAL)
+    root_logger.handlers = [file_handler]
+    root_logger.setLevel(logging.WARNING)
 
     from strix.tools.argument_parser import ArgumentConversionError, convert_arguments
     from strix.tools.registry import get_tool_by_name
 
     while True:
         try:
-            request = request_queue.get()
+            # Use timeout to prevent infinite blocking
+            try:
+                request = request_queue.get(timeout=QUEUE_TIMEOUT)
+            except Empty:
+                continue  # Keep worker alive, just no request received
 
             if request is None:
                 break

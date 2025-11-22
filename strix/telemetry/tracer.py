@@ -1,5 +1,8 @@
+import json
 import logging
+from dataclasses import dataclass, field
 from datetime import UTC, datetime
+from enum import Enum
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Optional
 from uuid import uuid4
@@ -10,6 +13,55 @@ if TYPE_CHECKING:
 
 
 logger = logging.getLogger(__name__)
+
+
+class EventType(Enum):
+    """Types of events tracked by the tracer."""
+
+    # Agent lifecycle events
+    AGENT_CREATED = "agent_created"
+    AGENT_STATUS_CHANGED = "agent_status_changed"
+    AGENT_ITERATION = "agent_iteration"
+    AGENT_STATE_TRANSITION = "agent_state_transition"
+
+    # Tool events
+    TOOL_START = "tool_start"
+    TOOL_COMPLETE = "tool_complete"
+    TOOL_ERROR = "tool_error"
+
+    # LLM events
+    LLM_REQUEST = "llm_request"
+    LLM_RESPONSE = "llm_response"
+    LLM_ERROR = "llm_error"
+
+    # Inter-agent communication
+    AGENT_MESSAGE_SENT = "agent_message_sent"
+    AGENT_MESSAGE_RECEIVED = "agent_message_received"
+
+    # Vulnerability events
+    VULNERABILITY_FOUND = "vulnerability_found"
+
+    # Scan events
+    SCAN_START = "scan_start"
+    SCAN_COMPLETE = "scan_complete"
+
+
+@dataclass
+class TracerEvent:
+    """A single event in the tracer event stream."""
+
+    event_type: EventType
+    timestamp: str
+    agent_id: str | None = None
+    data: dict[str, Any] = field(default_factory=dict)
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "event_type": self.event_type.value,
+            "timestamp": self.timestamp,
+            "agent_id": self.agent_id,
+            "data": self.data,
+        }
 
 _global_tracer: Optional["Tracer"] = None
 
@@ -50,8 +102,15 @@ class Tracer:
         self._run_dir: Path | None = None
         self._next_execution_id = 1
         self._next_message_id = 1
+        self._next_event_id = 1
 
+        # Unified event stream for real-time visibility
+        self.events: list[TracerEvent] = []
+        self._event_cursor: int = 0  # For consumers to track their position
+
+        # Callbacks for real-time notifications
         self.vulnerability_found_callback: Callable[[str, str, str, str], None] | None = None
+        self.event_callback: Callable[[TracerEvent], None] | None = None
 
     def set_run_name(self, run_name: str) -> None:
         self.run_name = run_name
@@ -67,6 +126,19 @@ class Tracer:
             self._run_dir.mkdir(exist_ok=True)
 
         return self._run_dir
+
+    def _save_metadata(self) -> None:
+        """Save metadata.json to run directory (called on scan start and updates)."""
+        try:
+            metadata_file = self.get_run_dir() / "metadata.json"
+            # Use atomic write pattern
+            temp_file = metadata_file.with_suffix(".json.tmp")
+            with temp_file.open("w", encoding="utf-8") as f:
+                json.dump(self.run_metadata, f, indent=2, ensure_ascii=False, default=str)
+            temp_file.replace(metadata_file)
+            logger.debug(f"Metadata saved to {metadata_file}")
+        except (OSError, IOError) as e:
+            logger.warning(f"Failed to save metadata: {e}")
 
     def add_vulnerability_report(
         self,
@@ -198,10 +270,49 @@ class Tracer:
             }
         )
 
+        # Immediately persist metadata on scan start
+        self._save_metadata()
+
+        # Emit scan start event
+        event = TracerEvent(
+            event_type=EventType.SCAN_START,
+            timestamp=datetime.now(UTC).isoformat(),
+            agent_id=None,
+            data={
+                "run_id": self.run_id,
+                "run_name": self.run_name,
+                "targets": config.get("targets", []),
+                "max_iterations": config.get("max_iterations", 200),
+            },
+        )
+        self._emit_event(event)
+
     def save_run_data(self) -> None:
         try:
             run_dir = self.get_run_dir()
             self.end_time = datetime.now(UTC).isoformat()
+
+            # Update and persist final metadata
+            self.run_metadata["end_time"] = self.end_time
+            self.run_metadata["status"] = "completed"
+            self.run_metadata["vulnerability_count"] = len(self.vulnerability_reports)
+            self.run_metadata["duration_seconds"] = self._calculate_duration()
+            self._save_metadata()
+
+            # Emit scan complete event
+            event = TracerEvent(
+                event_type=EventType.SCAN_COMPLETE,
+                timestamp=self.end_time,
+                agent_id=None,
+                data={
+                    "run_id": self.run_id,
+                    "duration_seconds": self._calculate_duration(),
+                    "vulnerability_count": len(self.vulnerability_reports),
+                    "agent_count": len(self.agents),
+                    "tool_execution_count": len(self.tool_executions),
+                },
+            )
+            self._emit_event(event)
 
             if self.final_scan_result:
                 penetration_test_report_file = run_dir / "penetration_test_report.md"
@@ -321,3 +432,228 @@ class Tracer:
 
     def cleanup(self) -> None:
         self.save_run_data()
+
+    # =========================================================================
+    # New Event Stream Methods for Real-Time Visibility
+    # =========================================================================
+
+    def _emit_event(self, event: TracerEvent) -> None:
+        """Add event to stream, persist to JSONL, and notify callback if registered."""
+        self.events.append(event)
+
+        # Append to JSONL file (crash-safe, append-only)
+        try:
+            events_file = self.get_run_dir() / "events.jsonl"
+            with events_file.open("a", encoding="utf-8") as f:
+                f.write(json.dumps(event.to_dict(), default=str) + "\n")
+        except (OSError, IOError) as e:
+            logger.warning(f"Failed to append event to JSONL: {e}")
+
+        if self.event_callback:
+            try:
+                self.event_callback(event)
+            except Exception:  # noqa: BLE001
+                logger.exception("Error in event callback")
+
+    def log_agent_iteration(
+        self,
+        agent_id: str,
+        iteration: int,
+        max_iterations: int,
+    ) -> None:
+        """Log an agent iteration event."""
+        event = TracerEvent(
+            event_type=EventType.AGENT_ITERATION,
+            timestamp=datetime.now(UTC).isoformat(),
+            agent_id=agent_id,
+            data={
+                "iteration": iteration,
+                "max_iterations": max_iterations,
+                "progress_pct": round((iteration / max_iterations) * 100, 1),
+            },
+        )
+        self._emit_event(event)
+
+    def log_agent_state_transition(
+        self,
+        agent_id: str,
+        from_state: str,
+        to_state: str,
+        reason: str | None = None,
+    ) -> None:
+        """Log an agent state transition event."""
+        event = TracerEvent(
+            event_type=EventType.AGENT_STATE_TRANSITION,
+            timestamp=datetime.now(UTC).isoformat(),
+            agent_id=agent_id,
+            data={
+                "from_state": from_state,
+                "to_state": to_state,
+                "reason": reason,
+            },
+        )
+        self._emit_event(event)
+
+    def log_llm_request(
+        self,
+        agent_id: str,
+        model: str,
+        prompt_tokens: int | None = None,
+        request_id: str | None = None,
+    ) -> str:
+        """Log an LLM request event. Returns request_id for correlation."""
+        if request_id is None:
+            request_id = f"llm-{self._next_event_id}"
+            self._next_event_id += 1
+
+        event = TracerEvent(
+            event_type=EventType.LLM_REQUEST,
+            timestamp=datetime.now(UTC).isoformat(),
+            agent_id=agent_id,
+            data={
+                "request_id": request_id,
+                "model": model,
+                "prompt_tokens": prompt_tokens,
+            },
+        )
+        self._emit_event(event)
+        return request_id
+
+    def log_llm_response(
+        self,
+        agent_id: str,
+        request_id: str,
+        input_tokens: int,
+        output_tokens: int,
+        duration_ms: float,
+        cost: float | None = None,
+        cached_tokens: int = 0,
+    ) -> None:
+        """Log an LLM response event."""
+        event = TracerEvent(
+            event_type=EventType.LLM_RESPONSE,
+            timestamp=datetime.now(UTC).isoformat(),
+            agent_id=agent_id,
+            data={
+                "request_id": request_id,
+                "input_tokens": input_tokens,
+                "output_tokens": output_tokens,
+                "cached_tokens": cached_tokens,
+                "total_tokens": input_tokens + output_tokens,
+                "duration_ms": round(duration_ms, 1),
+                "cost": round(cost, 6) if cost else None,
+            },
+        )
+        self._emit_event(event)
+
+    def log_llm_error(
+        self,
+        agent_id: str,
+        request_id: str,
+        error: str,
+        duration_ms: float | None = None,
+    ) -> None:
+        """Log an LLM error event."""
+        event = TracerEvent(
+            event_type=EventType.LLM_ERROR,
+            timestamp=datetime.now(UTC).isoformat(),
+            agent_id=agent_id,
+            data={
+                "request_id": request_id,
+                "error": error,
+                "duration_ms": round(duration_ms, 1) if duration_ms else None,
+            },
+        )
+        self._emit_event(event)
+
+    def log_agent_message_sent(
+        self,
+        from_agent_id: str,
+        to_agent_id: str,
+        message: str,
+    ) -> None:
+        """Log an inter-agent message sent event."""
+        event = TracerEvent(
+            event_type=EventType.AGENT_MESSAGE_SENT,
+            timestamp=datetime.now(UTC).isoformat(),
+            agent_id=from_agent_id,
+            data={
+                "to_agent_id": to_agent_id,
+                "message_preview": message[:200] + "..." if len(message) > 200 else message,
+                "message_length": len(message),
+            },
+        )
+        self._emit_event(event)
+
+    def log_agent_message_received(
+        self,
+        agent_id: str,
+        from_agent_id: str,
+        message: str,
+    ) -> None:
+        """Log an inter-agent message received event."""
+        event = TracerEvent(
+            event_type=EventType.AGENT_MESSAGE_RECEIVED,
+            timestamp=datetime.now(UTC).isoformat(),
+            agent_id=agent_id,
+            data={
+                "from_agent_id": from_agent_id,
+                "message_preview": message[:200] + "..." if len(message) > 200 else message,
+                "message_length": len(message),
+            },
+        )
+        self._emit_event(event)
+
+    def log_tool_event(
+        self,
+        agent_id: str,
+        tool_name: str,
+        event_type: EventType,
+        args: dict[str, Any] | None = None,
+        result: Any | None = None,
+        error: str | None = None,
+        duration_ms: float | None = None,
+    ) -> None:
+        """Log a tool execution event (start, complete, or error)."""
+        data: dict[str, Any] = {"tool_name": tool_name}
+
+        if args is not None:
+            # Truncate large args for display
+            args_str = str(args)
+            if len(args_str) > 500:
+                data["args_preview"] = args_str[:500] + "..."
+            else:
+                data["args"] = args
+
+        if result is not None:
+            result_str = str(result)
+            if len(result_str) > 500:
+                data["result_preview"] = result_str[:500] + "..."
+            else:
+                data["result"] = result
+
+        if error is not None:
+            data["error"] = error
+
+        if duration_ms is not None:
+            data["duration_ms"] = round(duration_ms, 1)
+
+        event = TracerEvent(
+            event_type=event_type,
+            timestamp=datetime.now(UTC).isoformat(),
+            agent_id=agent_id,
+            data=data,
+        )
+        self._emit_event(event)
+
+    def get_events_since(self, cursor: int = 0) -> tuple[list[TracerEvent], int]:
+        """Get all events since the given cursor position.
+
+        Returns (events, new_cursor) tuple.
+        """
+        new_events = self.events[cursor:]
+        return new_events, len(self.events)
+
+    def get_recent_events(self, count: int = 50) -> list[TracerEvent]:
+        """Get the most recent N events."""
+        return self.events[-count:] if self.events else []

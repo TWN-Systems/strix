@@ -10,6 +10,10 @@ services:
       - ./strix:/app/strix:ro
       # Mount target directory (change as needed)
       - ./target:/workspace:ro
+      # Mount templates for scope files
+      - ./templates:/app/templates:ro
+      # Mount agent_runs for persistent results
+      - ./agent_runs:/app/agent_runs
       # Docker socket for spawning sandbox containers
       - /var/run/docker.sock:/var/run/docker.sock
     environment:

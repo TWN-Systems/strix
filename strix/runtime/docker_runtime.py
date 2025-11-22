@@ -77,25 +77,31 @@ class DockerRuntime(AbstractRuntime):
                 logger.debug(f"Image {image_name} verified as available")
                 return
 
+    def _cleanup_failed_container(self, container_name: str) -> None:
+        """Clean up a partially created or failed container."""
+        try:
+            container = self.client.containers.get(container_name)
+            logger.warning(f"Cleaning up failed container {container_name}")
+            with contextlib.suppress(Exception):
+                container.stop(timeout=5)
+            container.remove(force=True)
+        except NotFound:
+            pass
+        except DockerException as e:
+            logger.warning(f"Error during container cleanup: {e}")
+
     def _create_container_with_retry(self, scan_id: str, max_retries: int = 3) -> Container:
         last_exception = None
         container_name = f"strix-scan-{scan_id}"
+        container: Container | None = None
 
         for attempt in range(max_retries):
             try:
                 self._verify_image_available(STRIX_IMAGE)
 
-                try:
-                    existing_container = self.client.containers.get(container_name)
-                    logger.warning(f"Container {container_name} already exists, removing it")
-                    with contextlib.suppress(Exception):
-                        existing_container.stop(timeout=5)
-                    existing_container.remove(force=True)
-                    time.sleep(1)
-                except NotFound:
-                    pass
-                except DockerException as e:
-                    logger.warning(f"Error checking/removing existing container: {e}")
+                # Clean up any existing container before creation
+                self._cleanup_failed_container(container_name)
+                time.sleep(1)
 
                 caido_port = self._find_available_port()
                 tool_server_port = self._find_available_port()
@@ -131,16 +137,19 @@ class DockerRuntime(AbstractRuntime):
                 self._initialize_container(
                     container, caido_port, tool_server_port, tool_server_token
                 )
-            except DockerException as e:
+            except (DockerException, RuntimeError, OSError) as e:
                 last_exception = e
+                logger.warning(f"Container creation attempt {attempt + 1}/{max_retries} failed: {e}")
+
+                # Clean up failed container to avoid orphans
+                self._cleanup_failed_container(container_name)
+                self._scan_container = None
+                self._tool_server_port = None
+                self._tool_server_token = None
+
                 if attempt == max_retries - 1:
                     logger.exception(f"Failed to create container after {max_retries} attempts")
                     break
-
-                logger.warning(f"Container creation attempt {attempt + 1}/{max_retries} failed")
-
-                self._tool_server_port = None
-                self._tool_server_token = None
 
                 sleep_time = (2**attempt) + (0.1 * attempt)
                 time.sleep(sleep_time)
