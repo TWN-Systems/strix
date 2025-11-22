@@ -269,6 +269,11 @@ Examples:
 
   # Custom instructions
   strix --target example.com --instruction "Focus on authentication vulnerabilities"
+
+  # Using scope file
+  strix --scope scope.yaml
+  strix --scope scope.yaml --filter "tags:critical"
+  strix --scope scope.yaml --validate
         """,
     )
 
@@ -276,10 +281,28 @@ Examples:
         "-t",
         "--target",
         type=str,
-        required=True,
+        required=False,
         action="append",
         help="Target to test (URL, repository, local directory path, domain name, or IP address). "
         "Can be specified multiple times for multi-target scans.",
+    )
+    parser.add_argument(
+        "--scope",
+        type=str,
+        help="Path to scope configuration file (YAML or JSON). "
+        "Defines targets, networks, exclusions, and settings.",
+    )
+    parser.add_argument(
+        "--filter",
+        type=str,
+        action="append",
+        help="Filter scope targets by criteria. Format: 'key:value'. "
+        "Supported keys: tags, network, type. Can be specified multiple times.",
+    )
+    parser.add_argument(
+        "--validate",
+        action="store_true",
+        help="Validate scope file and exit without running scan.",
     )
     parser.add_argument(
         "--instruction",
@@ -310,25 +333,161 @@ Examples:
 
     args = parser.parse_args()
 
+    # Require either --target or --scope
+    if not args.target and not args.scope:
+        parser.error("Either --target or --scope is required")
+
     args.targets_info = []
-    for target in args.target:
-        try:
-            target_type, target_dict = infer_target_type(target)
+    args.scope_config = None
 
-            if target_type == "local_code":
-                display_target = target_dict.get("target_path", target)
+    # Handle scope file
+    if args.scope:
+        args.scope_config = _load_scope_file(args.scope, args.filter, args.validate, parser)
+        if args.validate:
+            return args  # Early return for validation-only mode
+
+        # Get targets from scope
+        scope_targets = args.scope_config.to_targets_info()
+        args.targets_info.extend(scope_targets)
+
+        # Add scope-derived instruction context
+        scope_instruction = args.scope_config.get_instruction_context()
+        if scope_instruction:
+            if args.instruction:
+                args.instruction = f"{scope_instruction}. {args.instruction}"
             else:
-                display_target = target
+                args.instruction = scope_instruction
 
-            args.targets_info.append(
-                {"type": target_type, "details": target_dict, "original": display_target}
-            )
-        except ValueError:
-            parser.error(f"Invalid target '{target}'")
+    # Handle individual --target arguments
+    if args.target:
+        for target in args.target:
+            try:
+                target_type, target_dict = infer_target_type(target)
+
+                if target_type == "local_code":
+                    display_target = target_dict.get("target_path", target)
+                else:
+                    display_target = target
+
+                args.targets_info.append(
+                    {"type": target_type, "details": target_dict, "original": display_target}
+                )
+            except ValueError:
+                parser.error(f"Invalid target '{target}'")
+
+    if not args.targets_info:
+        parser.error("No valid targets found")
 
     assign_workspace_subdirs(args.targets_info)
 
     return args
+
+
+def _load_scope_file(
+    scope_path: str,
+    filters: list[str] | None,
+    validate_only: bool,
+    parser: argparse.ArgumentParser,
+) -> Any:
+    """Load and validate scope file."""
+    from strix.scope import ScopeConfig, validate_scope
+
+    console = Console()
+
+    try:
+        scope_config = ScopeConfig.from_file(Path(scope_path))
+    except FileNotFoundError:
+        parser.error(f"Scope file not found: {scope_path}")
+    except ValueError as e:
+        parser.error(f"Invalid scope file: {e}")
+    except Exception as e:
+        parser.error(f"Error loading scope file: {e}")
+
+    # Validate scope
+    result = validate_scope(scope_config.model)
+
+    if validate_only:
+        # Print validation results and exit
+        if result.valid:
+            console.print(f"\n[bold green]Scope file is valid:[/] {scope_path}\n")
+        else:
+            console.print(f"\n[bold red]Scope file has errors:[/] {scope_path}\n")
+
+        if result.errors:
+            console.print("[bold red]Errors:[/]")
+            for error in result.errors:
+                console.print(f"  [red]- {error}[/]")
+
+        if result.warnings:
+            console.print("\n[bold yellow]Warnings:[/]")
+            for warning in result.warnings:
+                console.print(f"  [yellow]- {warning}[/]")
+
+        # Print summary
+        console.print(f"\n[bold cyan]Scope Summary:[/]")
+        console.print(f"  Engagement: {scope_config.metadata.engagement_name}")
+        console.print(f"  Type: {scope_config.metadata.engagement_type}")
+        console.print(f"  Mode: {scope_config.settings.operational_mode}")
+        console.print(f"  Networks: {len(scope_config.networks)}")
+        console.print(f"  Targets: {len(scope_config.targets)}")
+        console.print()
+
+        if not result.valid:
+            sys.exit(1)
+        sys.exit(0)
+
+    # Show warnings but continue
+    if result.warnings:
+        for warning in result.warnings:
+            console.print(f"[yellow]Warning:[/] {warning}")
+
+    if not result.valid:
+        console.print("\n[bold red]Scope file has errors:[/]")
+        for error in result.errors:
+            console.print(f"  [red]- {error}[/]")
+        parser.error("Invalid scope file")
+
+    # Apply filters if specified
+    if filters:
+        _apply_scope_filters(scope_config, filters, parser)
+
+    return scope_config
+
+
+def _apply_scope_filters(
+    scope_config: Any, filters: list[str], parser: argparse.ArgumentParser
+) -> None:
+    """Apply filters to scope targets."""
+    tags_filter: list[str] = []
+    network_filter: str | None = None
+    type_filter: str | None = None
+
+    for f in filters:
+        if ":" not in f:
+            parser.error(f"Invalid filter format: {f}. Use 'key:value'")
+
+        key, value = f.split(":", 1)
+        key = key.lower().strip()
+        value = value.strip()
+
+        if key == "tags":
+            tags_filter.extend(v.strip() for v in value.split(","))
+        elif key == "network":
+            network_filter = value
+        elif key == "type":
+            type_filter = value
+        else:
+            parser.error(f"Unknown filter key: {key}. Supported: tags, network, type")
+
+    # Filter targets in place
+    filtered = scope_config.filter_targets(
+        tags=tags_filter if tags_filter else None,
+        network=network_filter,
+        target_type=type_filter,
+    )
+
+    # Replace targets with filtered list
+    scope_config.model.targets = filtered
 
 
 def display_completion_message(args: argparse.Namespace, results_path: Path) -> None:
@@ -451,6 +610,11 @@ def main() -> None:
         asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
 
     args = parse_arguments()
+
+    # Validation-only mode exits in parse_arguments via _load_scope_file
+    # This is a safety check in case the flow changes
+    if args.validate:
+        return
 
     check_docker_installed()
     pull_docker_image()

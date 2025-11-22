@@ -191,6 +191,8 @@ def create_agent(
     name: str,
     inherit_context: bool = True,
     prompt_modules: str | None = None,
+    agent_role: str | None = None,
+    model: str | None = None,
 ) -> dict[str, Any]:
     try:
         parent_id = agent_state.agent_id
@@ -228,19 +230,29 @@ def create_agent(
         from strix.agents.state import AgentState
         from strix.llm.config import LLMConfig
 
-        state = AgentState(task=task, agent_name=name, parent_id=parent_id, max_iterations=300)
+        state = AgentState(
+            task=task, agent_name=name, parent_id=parent_id, max_iterations=300, agent_role=agent_role
+        )
 
         parent_agent = _agent_instances.get(parent_id)
 
         timeout = None
-        if (
-            parent_agent
-            and hasattr(parent_agent, "llm_config")
-            and hasattr(parent_agent.llm_config, "timeout")
-        ):
-            timeout = parent_agent.llm_config.timeout
+        parent_model = None
+        if parent_agent and hasattr(parent_agent, "llm_config"):
+            if hasattr(parent_agent.llm_config, "timeout"):
+                timeout = parent_agent.llm_config.timeout
+            if hasattr(parent_agent.llm_config, "model_name"):
+                parent_model = parent_agent.llm_config.model_name
 
-        llm_config = LLMConfig(prompt_modules=module_list, timeout=timeout)
+        # Model fallback chain: explicit model -> parent model -> env default (in LLMConfig)
+        effective_model = model or parent_model
+
+        llm_config = LLMConfig(
+            model_name=effective_model,
+            prompt_modules=module_list,
+            timeout=timeout,
+            agent_role=agent_role,
+        )
 
         agent_config = {
             "llm_config": llm_config,

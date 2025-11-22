@@ -12,6 +12,76 @@ tools: list[dict[str, Any]] = []
 _tools_by_name: dict[str, Callable[..., Any]] = {}
 logger = logging.getLogger(__name__)
 
+# Role-based tool profiles - None means all tools available
+TOOL_PROFILES: dict[str, list[str] | None] = {
+    "root": [
+        "create_agent",
+        "view_agent_graph",
+        "finish_scan",
+        "send_message_to_agent",
+        "wait_for_message",
+        "think",
+    ],
+    "recon": [
+        "terminal",
+        "python",
+        "browser",
+        "proxy",
+        "think",
+        "agent_finish",
+        "create_agent",
+        "view_agent_graph",
+        "send_message_to_agent",
+        "wait_for_message",
+        "read_file",
+        "write_file",
+        "list_directory",
+        "web_search",
+    ],
+    "testing": [
+        "terminal",
+        "python",
+        "browser",
+        "proxy",
+        "think",
+        "agent_finish",
+        "create_agent",
+        "view_agent_graph",
+        "send_message_to_agent",
+        "wait_for_message",
+        "read_file",
+        "write_file",
+        "web_search",
+    ],
+    "validation": [
+        "terminal",
+        "python",
+        "browser",
+        "proxy",
+        "think",
+        "agent_finish",
+        "read_file",
+        "send_message_to_agent",
+    ],
+    "reporting": [
+        "create_vulnerability_report",
+        "read_file",
+        "write_file",
+        "think",
+        "agent_finish",
+        "send_message_to_agent",
+    ],
+    "fixing": [
+        "read_file",
+        "write_file",
+        "terminal",
+        "python",
+        "think",
+        "agent_finish",
+        "send_message_to_agent",
+    ],
+}
+
 
 class ImplementedInClientSideOnlyError(Exception):
     def __init__(
@@ -168,9 +238,52 @@ def should_execute_in_sandbox(tool_name: str) -> bool:
     return True
 
 
-def get_tools_prompt() -> str:
+def is_tool_allowed_for_role(tool_name: str, role: str | None) -> tuple[bool, str]:
+    """Check if a tool is allowed for a given agent role.
+
+    Args:
+        tool_name: Name of the tool to check
+        role: Agent role (e.g., 'root', 'recon', 'testing', 'validation', 'reporting', 'fixing')
+
+    Returns:
+        Tuple of (is_allowed, error_message)
+        - If allowed: (True, "")
+        - If denied: (False, "error description")
+    """
+    # No role specified = all tools allowed (backward compatibility)
+    if role is None:
+        return True, ""
+
+    # Unknown role = all tools allowed (permissive for custom roles)
+    if role not in TOOL_PROFILES:
+        logger.warning(f"Unknown agent role '{role}', allowing all tools")
+        return True, ""
+
+    allowed_tools = TOOL_PROFILES[role]
+
+    # None in profile means all tools allowed
+    if allowed_tools is None:
+        return True, ""
+
+    if tool_name in allowed_tools:
+        return True, ""
+
+    return False, (
+        f"Tool '{tool_name}' is not permitted for role '{role}'. "
+        f"Allowed tools: {', '.join(sorted(allowed_tools))}"
+    )
+
+
+def get_tools_prompt(role: str | None = None) -> str:
+    allowed_tools = None
+    if role and role in TOOL_PROFILES:
+        allowed_tools = TOOL_PROFILES[role]
+
     tools_by_module: dict[str, list[dict[str, Any]]] = {}
     for tool in tools:
+        tool_name = tool.get("name", "")
+        if allowed_tools is not None and tool_name not in allowed_tools:
+            continue
         module = tool.get("module", "unknown")
         if module not in tools_by_module:
             tools_by_module[module] = []

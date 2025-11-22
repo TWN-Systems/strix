@@ -169,8 +169,13 @@ class LLM:
 
                 self.jinja_env.globals["get_module"] = get_module
 
+                agent_role = self.config.agent_role
+
+                def get_tools_prompt_with_role() -> str:
+                    return get_tools_prompt(role=agent_role)
+
                 self.system_prompt = self.jinja_env.get_template("system_prompt.jinja").render(
-                    get_tools_prompt=get_tools_prompt,
+                    get_tools_prompt=get_tools_prompt_with_role,
                     loaded_module_names=list(prompt_module_content.keys()),
                     **prompt_module_content,
                 )

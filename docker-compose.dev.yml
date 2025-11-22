@@ -1,0 +1,21 @@
+services:
+  strix:
+    build:
+      context: .
+      dockerfile: Dockerfile.dev
+    env_file:
+      - .env
+    volumes:
+      # Mount source code for live editing
+      - ./strix:/app/strix:ro
+      # Mount target directory (change as needed)
+      - ./target:/workspace:ro
+      # Docker socket for spawning sandbox containers
+      - /var/run/docker.sock:/var/run/docker.sock
+    environment:
+      - STRIX_LLM=${STRIX_LLM:-openai/gpt-4o}
+      - LLM_API_KEY=${LLM_API_KEY}
+      - DOCKER_HOST=unix:///var/run/docker.sock
+    stdin_open: true
+    tty: true
+    network_mode: host

@@ -12,6 +12,7 @@ from .argument_parser import convert_arguments
 from .registry import (
     get_tool_by_name,
     get_tool_names,
+    is_tool_allowed_for_role,
     needs_agent_state,
     should_execute_in_sandbox,
 )
@@ -97,12 +98,23 @@ async def _execute_tool_locally(tool_name: str, agent_state: Any | None, **kwarg
     return await result if inspect.isawaitable(result) else result
 
 
-def validate_tool_availability(tool_name: str | None) -> tuple[bool, str]:
+def validate_tool_availability(
+    tool_name: str | None, agent_state: Any | None = None
+) -> tuple[bool, str]:
     if tool_name is None:
         return False, "Tool name is missing"
 
     if tool_name not in get_tool_names():
         return False, f"Tool '{tool_name}' is not available"
+
+    # Runtime role enforcement
+    agent_role = None
+    if agent_state is not None and hasattr(agent_state, "agent_role"):
+        agent_role = agent_state.agent_role
+
+    is_allowed, role_error = is_tool_allowed_for_role(tool_name, agent_role)
+    if not is_allowed:
+        return False, role_error
 
     return True, ""
 
@@ -110,7 +122,7 @@ def validate_tool_availability(tool_name: str | None) -> tuple[bool, str]:
 async def execute_tool_with_validation(
     tool_name: str | None, agent_state: Any | None = None, **kwargs: Any
 ) -> Any:
-    is_valid, error_msg = validate_tool_availability(tool_name)
+    is_valid, error_msg = validate_tool_availability(tool_name, agent_state)
     if not is_valid:
         return f"Error: {error_msg}"
 

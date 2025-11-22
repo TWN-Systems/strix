@@ -310,12 +310,19 @@ class StrixTUIApp(App):  # type: ignore[misc]
         self._setup_cleanup_handlers()
 
     def _build_scan_config(self, args: argparse.Namespace) -> dict[str, Any]:
-        return {
+        config = {
             "scan_id": args.run_name,
             "targets": args.targets_info,
             "user_instructions": args.instruction or "",
             "run_name": args.run_name,
         }
+
+        # Add scope context if scope file was loaded
+        if hasattr(args, "scope_config") and args.scope_config is not None:
+            config["scope_context"] = args.scope_config.get_agent_context()
+            config["exclusion_rules"] = args.scope_config.get_exclusion_rules()
+
+        return config
 
     def _build_agent_config(self, args: argparse.Namespace) -> dict[str, Any]:
         llm_config = LLMConfig()

@@ -70,6 +70,11 @@ async def run_cli(args: Any) -> None:  # noqa: PLR0915
         "run_name": args.run_name,
     }
 
+    # Add scope context if scope file was loaded
+    if hasattr(args, "scope_config") and args.scope_config is not None:
+        scan_config["scope_context"] = args.scope_config.get_agent_context()
+        scan_config["exclusion_rules"] = args.scope_config.get_exclusion_rules()
+
     llm_config = LLMConfig()
     agent_config = {
         "llm_config": llm_config,

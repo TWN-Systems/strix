@@ -12,6 +12,7 @@ def _generate_agent_id() -> str:
 class AgentState(BaseModel):
     agent_id: str = Field(default_factory=_generate_agent_id)
     agent_name: str = "Strix Agent"
+    agent_role: str | None = None
     parent_id: str | None = None
     sandbox_id: str | None = None
     sandbox_token: str | None = None

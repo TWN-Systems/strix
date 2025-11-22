@@ -9,18 +9,26 @@ class StrixAgent(BaseAgent):
 
     def __init__(self, config: dict[str, Any]):
         default_modules = []
+        agent_role = None
 
         state = config.get("state")
         if state is None or (hasattr(state, "parent_id") and state.parent_id is None):
             default_modules = ["root_agent"]
+            agent_role = "root"
 
-        self.default_llm_config = LLMConfig(prompt_modules=default_modules)
+        self.default_llm_config = LLMConfig(prompt_modules=default_modules, agent_role=agent_role)
 
         super().__init__(config)
+
+        # Set role on state for runtime enforcement (state may be created by BaseAgent)
+        if agent_role and hasattr(self.state, "agent_role"):
+            self.state.agent_role = agent_role
 
     async def execute_scan(self, scan_config: dict[str, Any]) -> dict[str, Any]:  # noqa: PLR0912
         user_instructions = scan_config.get("user_instructions", "")
         targets = scan_config.get("targets", [])
+        scope_context = scan_config.get("scope_context")
+        exclusion_rules = scan_config.get("exclusion_rules")
 
         repositories = []
         local_code = []
@@ -85,5 +93,42 @@ class StrixAgent(BaseAgent):
 
         if user_instructions:
             task_description += f"\n\nSpecial instructions: {user_instructions}"
+
+        # Inject scope context for agent awareness
+        if scope_context:
+            task_description += "\n\n<scope_context>"
+            task_description += f"\nEngagement: {scope_context.get('engagement', {}).get('name', 'Unknown')}"
+            task_description += f"\nType: {scope_context.get('engagement', {}).get('type', 'Unknown')}"
+            task_description += f"\nMode: {scope_context.get('settings', {}).get('mode', 'poc-only')}"
+            task_description += f"\nTargets in scope: {scope_context.get('target_count', 0)}"
+
+            networks = scope_context.get("networks", [])
+            if networks:
+                task_description += "\nNetworks:"
+                for net in networks:
+                    task_description += f"\n  - {net.get('name')}: {net.get('cidr', 'N/A')} ({net.get('type')})"
+
+            in_scope_domains = scope_context.get("in_scope_domains", [])
+            if in_scope_domains:
+                task_description += f"\nIn-scope domains: {', '.join(in_scope_domains)}"
+
+            task_description += "\n</scope_context>"
+
+        # Inject exclusion rules for agents to respect
+        if exclusion_rules:
+            task_description += "\n\n<exclusion_rules>"
+            if exclusion_rules.get("excluded_hosts"):
+                task_description += f"\nExcluded hosts: {', '.join(exclusion_rules['excluded_hosts'])}"
+            if exclusion_rules.get("excluded_cidrs"):
+                task_description += f"\nExcluded CIDRs: {', '.join(exclusion_rules['excluded_cidrs'])}"
+            if exclusion_rules.get("excluded_urls"):
+                task_description += f"\nExcluded URLs: {', '.join(exclusion_rules['excluded_urls'])}"
+            if exclusion_rules.get("excluded_paths"):
+                task_description += f"\nExcluded paths: {', '.join(exclusion_rules['excluded_paths'])}"
+            if exclusion_rules.get("excluded_ports"):
+                task_description += f"\nExcluded ports: {', '.join(map(str, exclusion_rules['excluded_ports']))}"
+            if exclusion_rules.get("out_of_scope_domains"):
+                task_description += f"\nOut-of-scope domains: {', '.join(exclusion_rules['out_of_scope_domains'])}"
+            task_description += "\n</exclusion_rules>"
 
         return await self.agent_loop(task=task_description)

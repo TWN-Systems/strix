@@ -1,0 +1,274 @@
+<proxmox_ve_security_guide>
+<title>PROXMOX VE — ADVERSARIAL TESTING AND EXPLOITATION</title>
+
+<critical>Proxmox VE exposes a REST API, web UI, SPICE/VNC consoles, SSH, and cluster services. Most impactful findings arise from API authentication bypasses, privilege escalation via misconfigured roles/permissions, exposed management interfaces, container/VM escape vectors, insecure cluster communication, and backup/storage misconfigurations. The API uses ticket-based authentication with CSRF tokens; always verify both are enforced across all endpoints.</critical>
+
+<scope>
+- Web UI and API (port 8006, /api2/json/)
+- Authentication: PAM, PVE, LDAP/AD, OpenID Connect
+- Authorization: Users, Groups, Roles, ACLs, Pools, Realms
+- VM/Container management: QEMU/KVM, LXC
+- Storage backends: local, NFS, CIFS, Ceph, ZFS, iSCSI, PBS
+- Networking: bridges, VLANs, SDN, firewall
+- Cluster: Corosync (5405/udp), pmxcfs, HA
+- Backup: vzdump, Proxmox Backup Server integration
+- Console access: SPICE, noVNC, xterm.js
+</scope>
+
+<methodology>
+1. Enumerate version and patch level via API or web UI; map to known CVEs.
+2. Identify authentication realms and obtain credentials for multiple privilege levels: no auth, unprivileged user, VM admin, full admin.
+3. Build Resource x Action x Principal matrix across API endpoints. Test CRUD operations on VMs, containers, storage, users, and cluster config.
+4. Probe network segmentation: can VMs/containers reach management interfaces? Are cluster ports exposed externally?
+5. Test console access controls, backup permissions, and storage ACLs for privilege boundaries.
+</methodology>
+
+<architecture>
+- API base: https://<host>:8006/api2/json/
+- Authentication flow: POST /api2/json/access/ticket with username@realm + password; returns ticket (cookie) + CSRFPreventionToken (header).
+- All state-changing requests require: Cookie: PVEAuthCookie=<ticket> AND CSRFPreventionToken: <token>
+- Realms: pam (system users), pve (Proxmox native), ldap, ad, openid
+- Permissions: Role-based ACLs on paths like /vms/<vmid>, /storage/<storage>, /pool/<pool>, /access/groups/<group>
+- Cluster: corosync for membership/quorum, pmxcfs for distributed config, pve-cluster service
+</architecture>
+
+<auth_and_tokens>
+- Ticket format: PVE:<username>@<realm>:<timestamp>::<signature>
+- Tickets expire (default 2 hours); refresh via /api2/json/access/ticket with existing cookie.
+- CSRFPreventionToken must match ticket; both required for POST/PUT/DELETE.
+- API tokens: <user>@<realm>!<tokenid>=<secret>; can have separate permissions from user.
+- Pitfalls:
+  - CSRF token not validated on some endpoints or HTTP methods.
+  - Ticket replay across nodes in cluster if clocks are skewed.
+  - API tokens with overly broad permissions stored in automation scripts.
+  - TFA (TOTP/U2F/Recovery) bypass via API token authentication.
+- Tests:
+  - Attempt state-changing requests without CSRFPreventionToken; verify rejection.
+  - Replay tickets across cluster nodes; check timestamp/signature validation.
+  - Enumerate API tokens via /api2/json/access/users/<user>/token; test token permissions.
+  - Bypass TFA: authenticate with API token instead of password+TFA.
+</auth_and_tokens>
+
+<api_endpoints>
+- Critical endpoints requiring elevated privileges:
+  - /nodes/<node>/qemu/<vmid>/agent/* - Guest agent commands (file read/write, exec)
+  - /nodes/<node>/execute - Arbitrary command execution (root only)
+  - /nodes/<node>/ceph/* - Ceph cluster management
+  - /cluster/config - Cluster-wide configuration
+  - /access/users, /access/groups, /access/roles, /access/acl - IAM management
+  - /nodes/<node>/storage/<storage>/upload - File upload to storage
+  - /nodes/<node>/vzdump - Backup operations
+- Common gaps:
+  - Unprivileged users with VM.Console can access guest agent if enabled.
+  - Pool administrators can escalate via storage access.
+  - Backup permissions allow reading VM disk contents.
+- Tests:
+  - As low-priv user, enumerate all accessible /nodes/<node>/qemu and /nodes/<node>/lxc.
+  - Try guest agent endpoints: /agent/file-read, /agent/exec; verify ACL enforcement.
+  - Attempt /nodes/<node>/execute as non-root; should fail.
+  - Upload malicious content to storage; check for path traversal in filename.
+</api_endpoints>
+
+<privilege_escalation>
+- Role hierarchy: PVEAdmin > PVEVMAdmin > PVEVMUser > PVEAuditor
+- ACL inheritance: permissions cascade from / down through /vms, /storage, /pool paths.
+- Escalation vectors:
+  - VM.Config.Options allows changing boot order, adding USB/PCI passthrough.
+  - VM.Config.Disk + storage access = mount host paths into VM.
+  - Container with nesting=1 or privileged=1 enables escape techniques.
+  - Datastore.AllocateTemplate on shared storage affects all VMs using it.
+  - Pool.Allocate allows adding VMs to pools, inheriting pool permissions.
+- Tests:
+  - Enumerate effective permissions: GET /api2/json/access/permissions
+  - As VMAdmin, try to modify ACLs: PUT /api2/json/access/acl
+  - Check if unprivileged containers can enable nesting/features post-creation.
+  - Verify storage isolation: can user A's VM access user B's storage?
+</privilege_escalation>
+
+<vm_container_security>
+- QEMU/KVM:
+  - Guest agent (qemu-ga): if enabled, host can execute commands in guest; verify ACLs.
+  - VNC/SPICE: websocket proxy at /api2/json/nodes/<node>/qemu/<vmid>/vncproxy.
+  - Passthrough (PCI/USB): can expose host devices; verify isolation.
+  - Live migration: transfers memory/disk; check for interception on network.
+- LXC Containers:
+  - Privileged containers run as root with host capabilities; escape is trivial.
+  - Unprivileged containers use user namespaces; verify uid/gid mapping.
+  - Features: nesting, fuse, mknod, keyctl - each weakens isolation.
+  - Bind mounts: check for host path exposure via mp0, mp1, etc.
+  - AppArmor/seccomp profiles: verify enforcement, check for bypass.
+- Tests:
+  - Inside container: cat /proc/1/cgroup, ls /dev, capsh --print to assess isolation.
+  - Check for CVE-2019-5736 (runc), CVE-2022-0185 (file_caps), container escapes.
+  - Verify AppArmor: cat /proc/self/attr/current should show profile.
+  - Attempt to access /dev/sda or mount host filesystems from within container.
+</vm_container_security>
+
+<console_access>
+- VNC proxy: /api2/json/nodes/<node>/qemu/<vmid>/vncproxy returns ticket + port.
+- SPICE proxy: /api2/json/nodes/<node>/qemu/<vmid>/spiceproxy returns connection file.
+- xterm.js: /api2/json/nodes/<node>/lxc/<vmid>/termproxy for container shell.
+- Websocket upgrade at wss://<host>:8006/api2/json/nodes/<node>/qemu/<vmid>/vncwebsocket
+- Risks:
+  - Console tickets may have longer validity than auth tickets.
+  - Websocket connections may not re-validate permissions after initial auth.
+  - VNC password (if set) often weak or shared across VMs.
+- Tests:
+  - Obtain VNC ticket, revoke user access, verify ticket still works (ticket lifetime issue).
+  - Connect to websocket with expired/revoked auth cookie; check enforcement.
+  - Enumerate VMs with VNC vs SPICE vs serial console; check password requirements.
+</console_access>
+
+<cluster_security>
+- Corosync: UDP 5405 for cluster communication; uses pre-shared key.
+- pmxcfs: distributed filesystem at /etc/pve; stores cluster config, VM configs, user database.
+- Join token: pvecm expected -y creates token valid for limited time.
+- Risks:
+  - Corosync key (/etc/corosync/authkey) disclosure allows cluster join.
+  - Exposed UDP 5405 allows cluster membership enumeration.
+  - pvecm add with stolen key adds malicious node.
+  - Split-brain scenarios during network partition.
+- Tests:
+  - Scan for UDP 5405 from external/VM networks; should be firewalled.
+  - If key obtained, attempt cluster join simulation.
+  - Check /etc/pve permissions; should not be world-readable.
+  - Verify HA fencing configuration to prevent resource contention.
+</cluster_security>
+
+<storage_security>
+- Storage types: local (dir/lvm/zfs), shared (NFS/CIFS/Ceph/iSCSI/GlusterFS), PBS
+- Content types: images, rootdir, vztmpl, backup, iso, snippets
+- Risks:
+  - NFS exports with no_root_squash allow host root escalation from VM.
+  - CIFS credentials stored in plaintext in /etc/pve/storage.cfg.
+  - Backup files (.vma, .tar) contain full disk images; sensitive data exposure.
+  - ISO storage allows uploading bootable images; malicious ISOs.
+  - Snippets (hookscripts, cloud-init) execute with elevated privileges.
+- Tests:
+  - Enumerate storage: GET /api2/json/storage; check each for permissions.
+  - Read backup files if Datastore.Audit granted; extract sensitive data.
+  - Upload hookscript to snippets storage; verify execution context.
+  - Check NFS mount options; verify root_squash enforcement.
+  - Attempt path traversal in storage upload endpoints.
+</storage_security>
+
+<backup_security>
+- vzdump: creates backups to storage; options include compression, encryption, mode (snapshot/suspend/stop).
+- PBS (Proxmox Backup Server): separate service for incremental, encrypted backups.
+- Risks:
+  - Backups contain encryption keys, passwords, sensitive data.
+  - Backup permissions separate from VM permissions; user may backup but not access VM.
+  - Unencrypted backups on shared storage readable by storage admins.
+  - Restore to different VM bypasses original VM's access controls.
+- Tests:
+  - With Datastore.AllocateSpace, attempt backup of VMs user doesn't own.
+  - Download backup file; extract and analyze contents.
+  - Restore backup to new VM under attacker's control.
+  - Check PBS encryption: are keys properly managed? Stored separately?
+</backup_security>
+
+<network_security>
+- Bridges: vmbr0 typically bridges physical NIC; VMs share L2 domain.
+- VLANs: 802.1q tagging; verify VLAN isolation between tenants.
+- SDN: software-defined networking zones, vnets; check isolation.
+- Firewall: datacenter, host, and VM/CT levels; nftables backend.
+- Risks:
+  - VMs on same bridge can ARP spoof, sniff traffic.
+  - Management interface (8006) reachable from VM network.
+  - Firewall disabled by default; even when enabled, rules may be lax.
+  - VLAN hopping if trunking misconfigured.
+- Tests:
+  - From VM, scan host IP on port 8006, 22, 3128 (spice), 5900-5999 (VNC).
+  - ARP scan from VM; identify other VMs and host on same bridge.
+  - Verify firewall rules: GET /api2/json/nodes/<node>/firewall/rules.
+  - Test VLAN isolation: can VM on VLAN 10 reach VLAN 20?
+</network_security>
+
+<known_cves>
+- CVE-2022-35508: API authentication bypass via crafted ticket.
+- CVE-2023-43320: XSS in web UI task viewer.
+- CVE-2024-21545: Privilege escalation via vzdump.
+- CVE-2024-21546: Information disclosure in cluster join.
+- Always check: https://pve.proxmox.com/wiki/Roadmap#Security_Advisories
+- Tests:
+  - Identify exact version: GET /api2/json/version
+  - Check pveversion -v output for package versions.
+  - Correlate with CVE databases; test applicable exploits in PoC mode.
+</known_cves>
+
+<bypass_techniques>
+- Content-type switching: API accepts JSON; try form-encoded for parser differences.
+- HTTP method override: X-HTTP-Method-Override header may bypass method restrictions.
+- Path normalization: /api2/json/nodes/node1/qemu/100 vs /api2/json/nodes/node1/qemu/100/ trailing slash.
+- Unicode/encoding: URL-encoded parameters may bypass input validation.
+- Header injection: Host header manipulation for SSRF or cache poisoning.
+- Race conditions: parallel requests during VM state changes (start/stop/migrate).
+</bypass_techniques>
+
+<blind_channels>
+- Task polling: /api2/json/nodes/<node>/tasks/<upid>/status reveals operation success/failure.
+- Error messages: detailed errors disclose internal paths, versions, configs.
+- Timing: authentication failures vs. invalid user vs. wrong password timing differences.
+- Cluster status: /api2/json/cluster/status reveals node names, IPs, quorum state.
+</blind_channels>
+
+<tooling_and_automation>
+- API exploration: curl with cookie/CSRF headers; pve-api-viewer for endpoint discovery.
+- Scanning: nmap for port enumeration; nuclei templates for Proxmox-specific checks.
+- Authentication: script ticket acquisition and renewal for long-running tests.
+- Container escape: use container escape toolkits (CDK, deepce) inside LXC.
+- Traffic analysis: tcpdump on bridges; Wireshark for SPICE/VNC protocols.
+- Backup analysis: qemu-img for .vma conversion; tar extraction for container backups.
+</tooling_and_automation>
+
+<reviewer_checklist>
+- Is the web UI (8006) restricted to management network only?
+- Are all API state-changing requests validating CSRFPreventionToken?
+- Do ACLs follow least-privilege; are default roles appropriately scoped?
+- Are TFA requirements enforced consistently (API tokens bypass TFA by design)?
+- Are containers unprivileged by default with appropriate AppArmor profiles?
+- Is cluster communication (Corosync) firewalled from untrusted networks?
+- Are backups encrypted and access-controlled separately from VM access?
+- Is network segmentation enforced between management, VM, and storage networks?
+- Are storage credentials (NFS/CIFS/iSCSI) properly secured?
+- Is guest agent access restricted to appropriate administrators?
+</reviewer_checklist>
+
+<validation>
+1. Demonstrate authentication bypass or CSRF token bypass on state-changing endpoint.
+2. Show privilege escalation from low-privilege user to VM access or admin functions.
+3. Prove container escape or host access from within VM/container.
+4. Document network segmentation failure (VM accessing management interface).
+5. Provide minimal PoC scripts with exact API calls, headers, and expected vs. actual responses.
+</validation>
+
+<false_positives>
+- Management interface intentionally exposed (documented homelab setup).
+- Privileged containers used for specific workloads with accepted risk.
+- Guest agent enabled for authorized monitoring/management.
+- Backup access granted to backup administrators by design.
+- Cluster ports accessible within trusted management VLAN only.
+</false_positives>
+
+<impact>
+- Full infrastructure compromise via API authentication bypass.
+- Cross-tenant VM access and data exfiltration.
+- Container/VM escape leading to host root access.
+- Cluster takeover via Corosync key disclosure.
+- Sensitive data exposure via backup access or storage misconfiguration.
+- Denial of service via resource exhaustion or cluster disruption.
+</impact>
+
+<pro_tips>
+1. Start with version enumeration; older Proxmox installations often lag on patches.
+2. Map the permission model completely before testing; ACLs are granular but complex.
+3. Test both web UI and direct API; UI may have additional client-side restrictions.
+4. Container escape is easier than VM escape; focus on LXC if present.
+5. Backup access is often overlooked; it's equivalent to full disk read access.
+6. Cluster join tokens and Corosync keys are crown jewels; trace their exposure.
+7. Guest agent is powerful; VM.Console permission may grant more than expected.
+8. Always verify network segmentation from inside VMs, not just from external scans.
+</pro_tips>
+
+<remember>Proxmox VE is a hypervisor—compromise means full infrastructure access. Every permission boundary (API auth, ACLs, container isolation, network segmentation, cluster membership) must be validated independently. Focus on the gaps between intended isolation and actual enforcement.</remember>
+</proxmox_ve_security_guide>

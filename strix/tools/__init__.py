@@ -10,10 +10,12 @@ from .executor import (
     validate_tool_availability,
 )
 from .registry import (
+    TOOL_PROFILES,
     ImplementedInClientSideOnlyError,
     get_tool_by_name,
     get_tool_names,
     get_tools_prompt,
+    is_tool_allowed_for_role,
     needs_agent_state,
     register_tool,
     tools,
@@ -48,6 +50,7 @@ else:
 
 __all__ = [
     "ImplementedInClientSideOnlyError",
+    "TOOL_PROFILES",
     "execute_tool",
     "execute_tool_invocation",
     "execute_tool_with_validation",
@@ -55,6 +58,7 @@ __all__ = [
     "get_tool_by_name",
     "get_tool_names",
     "get_tools_prompt",
+    "is_tool_allowed_for_role",
     "needs_agent_state",
     "process_tool_invocations",
     "register_tool",

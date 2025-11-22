@@ -1,0 +1,41 @@
+FROM python:3.12-slim
+
+LABEL description="Strix Development Environment"
+
+# Install system dependencies and Docker CLI
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    git \
+    curl \
+    build-essential \
+    ca-certificates \
+    gnupg \
+    && install -m 0755 -d /etc/apt/keyrings \
+    && curl -fsSL https://download.docker.com/linux/debian/gpg | gpg --dearmor -o /etc/apt/keyrings/docker.gpg \
+    && chmod a+r /etc/apt/keyrings/docker.gpg \
+    && echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/debian bookworm stable" > /etc/apt/sources.list.d/docker.list \
+    && apt-get update \
+    && apt-get install -y --no-install-recommends docker-ce-cli \
+    && rm -rf /var/lib/apt/lists/*
+
+# Install Poetry
+RUN curl -sSL https://install.python-poetry.org | python3 - && \
+    ln -s /root/.local/bin/poetry /usr/local/bin/poetry
+
+# Set working directory
+WORKDIR /app
+
+# Copy dependency files first for layer caching
+COPY pyproject.toml poetry.lock ./
+
+# Install dependencies (no dev deps for running, add --with=dev if needed)
+RUN poetry config virtualenvs.create false && \
+    poetry install --no-root --no-interaction
+
+# Copy the rest of the application
+COPY . .
+
+# Install the package itself
+RUN poetry install --no-interaction
+
+# Default command
+ENTRYPOINT ["strix"]
