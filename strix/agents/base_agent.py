@@ -21,6 +21,9 @@ from strix.tools import process_tool_invocations
 from .reconciliation import StateReconciler
 from .state import AgentState
 
+if TYPE_CHECKING:
+    from strix.telemetry.run_plan import RunPlan
+
 
 logger = logging.getLogger(__name__)
 
@@ -190,6 +193,89 @@ class BaseAgent(metaclass=AgentMeta):
         self._last_reconciliation_iteration = self.state.iteration
         self._consecutive_failures = 0
 
+    def _inject_plan_context(self, tracer: Optional["Tracer"]) -> None:
+        """Inject plan context into the conversation if available."""
+        if tracer is None or tracer._plan is None:
+            return
+
+        plan = tracer._plan
+
+        if self.state.parent_id is not None:
+            return
+
+        if not plan.tasks:
+            return
+
+        if self.state.iteration > 1 and self.state.iteration % 25 != 0:
+            return
+
+        current_task = plan.get_current_task()
+        next_task = plan.get_next_task() if current_task is None else None
+        progress = plan.get_progress()
+
+        context_lines = [
+            "<plan_context>",
+            "<notice>This is a reminder of the current run plan and progress.</notice>",
+            "",
+            f"Plan: {plan.title}",
+            f"Progress: {progress['completed']}/{progress['total']} tasks ({progress['percent_complete']}%)",
+            "",
+        ]
+
+        if current_task:
+            context_lines.extend(
+                [
+                    "Current Task:",
+                    f"  - Title: {current_task.title}",
+                    f"  - Description: {current_task.description}" if current_task.description else "",
+                    "",
+                ]
+            )
+        elif next_task:
+            context_lines.extend(
+                [
+                    "Next Task to Start:",
+                    f"  - Title: {next_task.title}",
+                    f"  - Description: {next_task.description}" if next_task.description else "",
+                    "",
+                ]
+            )
+
+        pending_tasks = plan.get_pending_tasks()[:5]
+        if pending_tasks:
+            context_lines.append("Upcoming Tasks:")
+            for task in pending_tasks:
+                context_lines.append(f"  - {task.title}")
+            context_lines.append("")
+
+        context_lines.append("</plan_context>")
+
+        context_message = "\n".join(line for line in context_lines if line is not None)
+        self.state.add_message("user", context_message)
+
+    def _update_plan_from_action(
+        self, tracer: Optional["Tracer"], action: dict[str, Any], success: bool
+    ) -> None:
+        """Update the plan based on action completion."""
+        if tracer is None or tracer._plan is None:
+            return
+
+        plan = tracer._plan
+        current_task = plan.get_current_task()
+
+        if current_task is None:
+            return
+
+        action_name = action.get("function", {}).get("name", "")
+        if action_name in ("finish_scan", "agent_finish"):
+            if success:
+                plan.complete_task(
+                    current_task.task_id,
+                    result={"action": action_name},
+                    iteration=self.state.iteration,
+                )
+            tracer.save_plan()
+
     async def agent_loop(self, task: str) -> dict[str, Any]:  # noqa: PLR0912, PLR0915
         await self._initialize_sandbox_and_state(task)
 
@@ -218,6 +304,8 @@ class BaseAgent(metaclass=AgentMeta):
 
             if self._should_run_reconciliation():
                 self._run_reconciliation_check(tracer)
+
+            self._inject_plan_context(tracer)
 
             if (
                 self.state.is_approaching_max_iterations()

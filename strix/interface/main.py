@@ -33,7 +33,8 @@ from strix.interface.utils import (
     validate_llm_response,
 )
 from strix.runtime.docker_runtime import STRIX_IMAGE
-from strix.telemetry.tracer import get_global_tracer
+from strix.telemetry.run_plan import RunPlan
+from strix.telemetry.tracer import Tracer, get_global_tracer, set_global_tracer
 
 
 logging.getLogger().setLevel(logging.ERROR)
@@ -273,6 +274,10 @@ Examples:
   # Custom instructions (from file)
   strix --target example.com --instruction ./instructions.txt
   strix --target https://app.com --instruction /path/to/detailed_instructions.md
+
+  # Continue a previous run
+  strix --continue my-scan-830a
+  strix --continue "webapp_analysis_abc123" --non-interactive
         """,
     )
 
@@ -280,10 +285,19 @@ Examples:
         "-t",
         "--target",
         type=str,
-        required=True,
         action="append",
         help="Target to test (URL, repository, local directory path, domain name, or IP address). "
         "Can be specified multiple times for multi-target scans.",
+    )
+    parser.add_argument(
+        "-c",
+        "--continue",
+        dest="continue_run",
+        type=str,
+        metavar="RUN_NAME",
+        help="Continue a previous run by its name (e.g., 'my-scan-830a'). "
+        "Loads the run plan and state from the previous run and resumes execution. "
+        "Use with --non-interactive for headless continuation.",
     )
     parser.add_argument(
         "--instruction",
@@ -316,6 +330,12 @@ Examples:
 
     args = parser.parse_args()
 
+    if not args.continue_run and not args.target:
+        parser.error("Either --target or --continue is required")
+
+    if args.continue_run and args.target:
+        parser.error("Cannot use --continue with --target. Use --continue alone to resume a run.")
+
     if args.instruction:
         instruction_path = Path(args.instruction)
         if instruction_path.exists() and instruction_path.is_file():
@@ -328,22 +348,23 @@ Examples:
                 parser.error(f"Failed to read instruction file '{instruction_path}': {e}")
 
     args.targets_info = []
-    for target in args.target:
-        try:
-            target_type, target_dict = infer_target_type(target)
+    if args.target:
+        for target in args.target:
+            try:
+                target_type, target_dict = infer_target_type(target)
 
-            if target_type == "local_code":
-                display_target = target_dict.get("target_path", target)
-            else:
-                display_target = target
+                if target_type == "local_code":
+                    display_target = target_dict.get("target_path", target)
+                else:
+                    display_target = target
 
-            args.targets_info.append(
-                {"type": target_type, "details": target_dict, "original": display_target}
-            )
-        except ValueError:
-            parser.error(f"Invalid target '{target}'")
+                args.targets_info.append(
+                    {"type": target_type, "details": target_dict, "original": display_target}
+                )
+            except ValueError:
+                parser.error(f"Invalid target '{target}'")
 
-    assign_workspace_subdirs(args.targets_info)
+        assign_workspace_subdirs(args.targets_info)
 
     return args
 
@@ -463,6 +484,99 @@ def pull_docker_image() -> None:
     console.print()
 
 
+def load_previous_run(run_name: str) -> tuple[dict, RunPlan | None] | None:
+    """Load a previous run's state and plan for continuation."""
+    console = Console()
+    runs_dir = Path.cwd() / "strix_runs"
+    run_dir = runs_dir / run_name
+
+    if not run_dir.exists():
+        available_runs = [d.name for d in runs_dir.iterdir() if d.is_dir()] if runs_dir.exists() else []
+
+        error_text = Text()
+        error_text.append("❌ ", style="bold red")
+        error_text.append(f"Run '{run_name}' not found\n\n", style="bold red")
+
+        if available_runs:
+            error_text.append("Available runs:\n", style="white")
+            for r in sorted(available_runs)[-10:]:
+                error_text.append(f"  • {r}\n", style="cyan")
+            if len(available_runs) > 10:
+                error_text.append(f"  ... and {len(available_runs) - 10} more\n", style="dim")
+        else:
+            error_text.append("No previous runs found in strix_runs/\n", style="dim")
+
+        panel = Panel(
+            error_text,
+            title="[bold red]RUN NOT FOUND",
+            border_style="red",
+            padding=(1, 2),
+        )
+        console.print(panel)
+        return None
+
+    run_state = Tracer.load_run_state(run_dir)
+    plan = RunPlan.load(run_dir)
+
+    if run_state is None:
+        error_text = Text()
+        error_text.append("❌ ", style="bold red")
+        error_text.append(f"Could not load state for run '{run_name}'\n", style="bold red")
+        error_text.append("The run directory exists but run_state.json is missing or corrupted.\n", style="white")
+
+        panel = Panel(
+            error_text,
+            title="[bold red]INVALID RUN STATE",
+            border_style="red",
+            padding=(1, 2),
+        )
+        console.print(panel)
+        return None
+
+    return run_state, plan
+
+
+def display_continuation_info(run_name: str, run_state: dict, plan: RunPlan | None) -> None:
+    """Display information about the run being continued."""
+    console = Console()
+
+    info_text = Text()
+    info_text.append("🔄 ", style="bold blue")
+    info_text.append("CONTINUING PREVIOUS RUN\n\n", style="bold blue")
+    info_text.append(f"Run Name: ", style="white")
+    info_text.append(f"{run_name}\n", style="cyan")
+    info_text.append(f"Started: ", style="white")
+    info_text.append(f"{run_state.get('start_time', 'Unknown')}\n", style="dim")
+
+    if plan:
+        progress = plan.get_progress()
+        info_text.append(f"\nPlan Progress: ", style="white")
+        info_text.append(f"{progress['completed']}/{progress['total']} tasks ", style="green")
+        info_text.append(f"({progress['percent_complete']}%)\n", style="dim")
+
+        if progress['in_progress'] > 0:
+            info_text.append(f"In Progress: ", style="white")
+            info_text.append(f"{progress['in_progress']} task(s)\n", style="yellow")
+
+        if progress['failed'] > 0:
+            info_text.append(f"Failed: ", style="white")
+            info_text.append(f"{progress['failed']} task(s)\n", style="red")
+
+        current_task = plan.get_current_task()
+        if current_task:
+            info_text.append(f"\nResuming from: ", style="white")
+            info_text.append(f"{current_task.title}\n", style="bold cyan")
+
+    panel = Panel(
+        info_text,
+        title="[bold blue]📋 RUN CONTINUATION",
+        border_style="blue",
+        padding=(1, 2),
+    )
+    console.print(panel)
+    console.print()
+
+
 def main() -> None:
     if sys.platform == "win32":
         asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
@@ -475,17 +589,53 @@ def main() -> None:
     validate_environment()
     asyncio.run(warm_up_llm())
 
-    if not args.run_name:
-        args.run_name = generate_run_name(args.targets_info)
+    if args.continue_run:
+        result = load_previous_run(args.continue_run)
+        if result is None:
+            sys.exit(1)
 
-    for target_info in args.targets_info:
-        if target_info["type"] == "repository":
-            repo_url = target_info["details"]["target_repo"]
-            dest_name = target_info["details"].get("workspace_subdir")
-            cloned_path = clone_repository(repo_url, args.run_name, dest_name)
-            target_info["details"]["cloned_repo_path"] = cloned_path
+        run_state, plan = result
+        args.run_name = args.continue_run
+        args.is_continuation = True
 
-    args.local_sources = collect_local_sources(args.targets_info)
+        display_continuation_info(args.continue_run, run_state, plan)
+
+        tracer = Tracer(run_name=args.run_name)
+        tracer.scan_config = run_state.get("scan_config")
+        tracer.run_metadata = run_state.get("run_metadata", {})
+        tracer.mark_as_continuation({
+            "previous_state": run_state,
+            "resumed_at": None,
+        })
+
+        if plan:
+            tracer.set_plan(plan)
+            if plan.is_paused:
+                plan.resume()
+
+        set_global_tracer(tracer)
+
+        args.targets_info = run_state.get("run_metadata", {}).get("targets", [])
+        if isinstance(args.targets_info, list) and args.targets_info:
+            if isinstance(args.targets_info[0], str):
+                args.targets_info = [{"type": "unknown", "details": {}, "original": t} for t in args.targets_info]
+
+        args.local_sources = []
+
+    else:
+        args.is_continuation = False
+
+        if not args.run_name:
+            args.run_name = generate_run_name(args.targets_info)
+
+        for target_info in args.targets_info:
+            if target_info["type"] == "repository":
+                repo_url = target_info["details"]["target_repo"]
+                dest_name = target_info["details"].get("workspace_subdir")
+                cloned_path = clone_repository(repo_url, args.run_name, dest_name)
+                target_info["details"]["cloned_repo_path"] = cloned_path
+
+        args.local_sources = collect_local_sources(args.targets_info)
 
     if args.non_interactive:
         asyncio.run(run_cli(args))

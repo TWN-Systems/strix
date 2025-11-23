@@ -5,6 +5,8 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any, Optional
 from uuid import uuid4
 
+from .run_plan import RunPlan
+
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -55,6 +57,56 @@ class Tracer:
         self._saved_vuln_ids: set[str] = set()
 
         self.vulnerability_found_callback: Callable[[str, str, str, str], None] | None = None
+
+        self._plan: RunPlan | None = None
+        self._is_continuation: bool = False
+        self._continuation_context: dict[str, Any] = {}
+
+    @property
+    def plan(self) -> RunPlan:
+        """Get or create the run plan."""
+        if self._plan is None:
+            self._plan = RunPlan(run_name=self.run_name or self.run_id)
+        return self._plan
+
+    @plan.setter
+    def plan(self, value: RunPlan) -> None:
+        """Set the run plan."""
+        self._plan = value
+
+    def set_plan(self, plan: RunPlan) -> None:
+        """Set the run plan (for loading from disk)."""
+        self._plan = plan
+        self._plan.run_name = self.run_name or self.run_id
+
+    def save_plan(self) -> Path | None:
+        """Save the current plan to the run directory."""
+        if self._plan is None:
+            return None
+
+        run_dir = self.get_run_dir()
+        return self._plan.save(run_dir)
+
+    def load_plan(self) -> RunPlan | None:
+        """Load the plan from the run directory if it exists."""
+        run_dir = self.get_run_dir()
+        plan = RunPlan.load(run_dir)
+        if plan:
+            self._plan = plan
+            self._plan.run_name = self.run_name or self.run_id
+        return plan
+
+    def mark_as_continuation(self, context: dict[str, Any] | None = None) -> None:
+        """Mark this run as a continuation of a previous run."""
+        self._is_continuation = True
+        self._continuation_context = context or {}
+        self.run_metadata["is_continuation"] = True
+        self.run_metadata["continuation_context"] = self._continuation_context
+
+    @property
+    def is_continuation(self) -> bool:
+        """Check if this is a continuation run."""
+        return self._is_continuation
 
     def set_run_name(self, run_name: str) -> None:
         self.run_name = run_name
@@ -338,10 +390,55 @@ class Tracer:
                     )
                 logger.info(f"Updated vulnerability index: {vuln_csv_file}")
 
+            if self._plan is not None:
+                self._plan.save(run_dir)
+
+            self._save_run_state(run_dir, mark_complete)
+
             logger.info(f"📊 Essential scan data saved to: {run_dir}")
 
         except (OSError, RuntimeError):
             logger.exception("Failed to save scan data")
+
+    def _save_run_state(self, run_dir: Path, mark_complete: bool = False) -> None:
+        """Save the run state for continuation."""
+        state_file = run_dir / "run_state.json"
+
+        run_state = {
+            "run_id": self.run_id,
+            "run_name": self.run_name,
+            "start_time": self.start_time,
+            "end_time": self.end_time,
+            "is_complete": mark_complete,
+            "is_continuation": self._is_continuation,
+            "continuation_context": self._continuation_context,
+            "scan_config": self.scan_config,
+            "run_metadata": self.run_metadata,
+            "agents_count": len(self.agents),
+            "tool_executions_count": len(self.tool_executions),
+            "chat_messages_count": len(self.chat_messages),
+            "vulnerability_reports_count": len(self.vulnerability_reports),
+            "has_plan": self._plan is not None,
+            "plan_progress": self._plan.get_progress() if self._plan else None,
+        }
+
+        with state_file.open("w", encoding="utf-8") as f:
+            json.dump(run_state, f, indent=2, ensure_ascii=False)
+
+    @classmethod
+    def load_run_state(cls, run_dir: Path) -> dict[str, Any] | None:
+        """Load run state from a directory."""
+        state_file = run_dir / "run_state.json"
+
+        if not state_file.exists():
+            return None
+
+        try:
+            with state_file.open("r", encoding="utf-8") as f:
+                return json.load(f)
+        except (json.JSONDecodeError, OSError) as e:
+            logger.warning(f"Failed to load run state: {e}")
+            return None
 
     def _calculate_duration(self) -> float:
         try:
