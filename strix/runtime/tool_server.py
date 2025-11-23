@@ -89,6 +89,9 @@ def agent_worker(_agent_id: str, request_queue: Queue[Any], response_queue: Queu
     from strix.tools.argument_parser import ArgumentConversionError, convert_arguments
     from strix.tools.registry import get_tool_by_name
 
+    consecutive_errors = 0
+    max_consecutive_errors = 5
+
     while True:
         try:
             # Use timeout to prevent infinite blocking
@@ -113,30 +116,79 @@ def agent_worker(_agent_id: str, request_queue: Queue[Any], response_queue: Queu
                 result = tool_func(**converted_kwargs)
 
                 response_queue.put({"result": result})
+                consecutive_errors = 0  # Reset on success
 
             except (ArgumentConversionError, ValidationError) as e:
                 response_queue.put({"error": f"Invalid arguments: {e}"})
             except (RuntimeError, ValueError, ImportError) as e:
                 response_queue.put({"error": f"Tool execution error: {e}"})
+            except Exception as e:  # noqa: BLE001
+                # Catch-all for unexpected errors
+                consecutive_errors += 1
+                response_queue.put({"error": f"Unexpected error ({type(e).__name__}): {e}"})
+                if consecutive_errors >= max_consecutive_errors:
+                    response_queue.put({"error": "Worker terminating due to repeated errors"})
+                    break
 
-        except (RuntimeError, ValueError, ImportError) as e:
-            response_queue.put({"error": f"Worker error: {e}"})
+        except Exception as e:  # noqa: BLE001
+            # Critical error in worker loop itself
+            try:
+                response_queue.put({"error": f"Critical worker error: {e}"})
+            except Exception:  # noqa: BLE001
+                pass  # Queue might be broken
+            break  # Exit worker on critical errors
+
+
+def _create_agent_process(agent_id: str) -> tuple[Queue[Any], Queue[Any]]:
+    """Create a new worker process for an agent."""
+    request_queue: Queue[Any] = Queue()
+    response_queue: Queue[Any] = Queue()
+
+    process = Process(
+        target=agent_worker, args=(agent_id, request_queue, response_queue), daemon=True
+    )
+    process.start()
+
+    agent_processes[agent_id] = {"process": process, "pid": process.pid}
+    agent_queues[agent_id] = {"request": request_queue, "response": response_queue}
+
+    return request_queue, response_queue
+
+
+def _cleanup_dead_process(agent_id: str) -> None:
+    """Clean up resources for a dead worker process."""
+    if agent_id in agent_processes:
+        try:
+            process = agent_processes[agent_id]["process"]
+            if process.is_alive():
+                process.terminate()
+                process.join(timeout=1)
+        except Exception:  # noqa: BLE001
+            pass
+        del agent_processes[agent_id]
+
+    if agent_id in agent_queues:
+        del agent_queues[agent_id]
 
 
 def ensure_agent_process(agent_id: str) -> tuple[Queue[Any], Queue[Any]]:
-    if agent_id not in agent_processes:
-        request_queue: Queue[Any] = Queue()
-        response_queue: Queue[Any] = Queue()
+    """Ensure a healthy worker process exists for the agent, restarting if needed."""
+    if agent_id in agent_processes:
+        process = agent_processes[agent_id]["process"]
+        if not process.is_alive():
+            # Process died, clean up and restart
+            logging.getLogger(__name__).warning(
+                f"Agent worker {agent_id} (pid {agent_processes[agent_id]['pid']}) died, restarting"
+            )
+            _cleanup_dead_process(agent_id)
+            return _create_agent_process(agent_id)
 
-        process = Process(
-            target=agent_worker, args=(agent_id, request_queue, response_queue), daemon=True
-        )
-        process.start()
+        return agent_queues[agent_id]["request"], agent_queues[agent_id]["response"]
 
-        agent_processes[agent_id] = {"process": process, "pid": process.pid}
-        agent_queues[agent_id] = {"request": request_queue, "response": response_queue}
+    return _create_agent_process(agent_id)
 
-    return agent_queues[agent_id]["request"], agent_queues[agent_id]["response"]
+
+RESPONSE_TIMEOUT = 180  # 3 minutes max wait for tool response
 
 
 @app.post("/execute", response_model=ToolExecutionResponse)
@@ -151,7 +203,16 @@ async def execute_tool(
 
     try:
         loop = asyncio.get_event_loop()
-        response = await loop.run_in_executor(None, response_queue.get)
+
+        # Use timeout to prevent indefinite blocking
+        def get_response_with_timeout() -> dict[str, Any]:
+            from queue import Empty
+            try:
+                return response_queue.get(timeout=RESPONSE_TIMEOUT)
+            except Empty:
+                return {"error": f"Tool execution timed out after {RESPONSE_TIMEOUT}s"}
+
+        response = await loop.run_in_executor(None, get_response_with_timeout)
 
         if "error" in response:
             return ToolExecutionResponse(error=response["error"])
@@ -159,6 +220,8 @@ async def execute_tool(
 
     except (RuntimeError, ValueError, OSError) as e:
         return ToolExecutionResponse(error=f"Worker error: {e}")
+    except Exception as e:  # noqa: BLE001
+        return ToolExecutionResponse(error=f"Unexpected error: {type(e).__name__}: {e}")
 
 
 @app.post("/register_agent")

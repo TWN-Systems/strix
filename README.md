@@ -196,6 +196,44 @@ jobs:
         run: strix -n -t ./
 ```
 
+### 📋 Scope Configuration
+
+For complex assessments with multiple targets, networks, and credentials, use a scope configuration file:
+
+```bash
+# Run with a scope file
+strix --scope scope.yaml
+
+# Validate scope file before running
+strix --scope scope.yaml --validate
+
+# Filter to specific targets
+strix --scope scope.yaml --filter "tags:critical"
+strix --scope scope.yaml --filter "network:Management"
+```
+
+**Scope templates** are available in `templates/scope/` for common scenarios:
+
+```bash
+# Proxmox cluster assessment
+strix --scope templates/scope/proxmox-cluster.yaml
+
+# Filter to management network only
+strix --scope templates/scope/proxmox-cluster.yaml --filter "network:Proxmox Management"
+```
+
+Technology modules provide specialized testing guidance. Enable them per-target in your scope file:
+
+```yaml
+targets:
+  - host: "10.0.101.2"
+    name: "pve-node"
+    type: "infrastructure"
+    modules: ["proxmox_ve"]  # Loads Proxmox VE testing guidance
+```
+
+See [Scope Configuration Guide](docs/SCOPE_CONFIGURATION.md) for full documentation.
+
 ### ⚙️ Configuration
 
 ```bash

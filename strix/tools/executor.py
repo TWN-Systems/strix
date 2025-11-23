@@ -1,4 +1,6 @@
+import asyncio
 import inspect
+import logging
 import os
 import time
 import traceback
@@ -359,6 +361,25 @@ def _get_tracer_and_agent_id(agent_state: Any | None) -> tuple[Any | None, str]:
     return tracer, agent_id
 
 
+# Tools that must run sequentially (state-modifying or terminal)
+SEQUENTIAL_TOOLS = frozenset({
+    "finish_scan",
+    "agent_finish",
+    "create_agent",
+    "send_message_to_agent",
+    "create_vulnerability_report",
+    "save_progress",
+    "create_note",
+    "update_note",
+    "str_replace_editor",
+})
+
+
+def _is_parallelizable(tool_name: str) -> bool:
+    """Check if a tool can be executed in parallel with others."""
+    return tool_name not in SEQUENTIAL_TOOLS
+
+
 async def process_tool_invocations(
     tool_invocations: list[dict[str, Any]],
     conversation_history: list[dict[str, Any]],
@@ -370,10 +391,64 @@ async def process_tool_invocations(
 
     tracer, agent_id = _get_tracer_and_agent_id(agent_state)
 
-    for tool_inv in tool_invocations:
-        observation_xml, images, tool_should_finish = await _execute_single_tool(
-            tool_inv, agent_state, tracer, agent_id
+    # Separate parallelizable and sequential tools while preserving order
+    parallel_batch: list[tuple[int, dict[str, Any]]] = []
+    results: dict[int, tuple[str, list[dict[str, Any]], bool]] = {}
+
+    async def execute_parallel_batch() -> None:
+        """Execute accumulated parallel tools concurrently."""
+        nonlocal parallel_batch
+        if not parallel_batch:
+            return
+
+        async def run_indexed(idx: int, inv: dict[str, Any]) -> tuple[int, tuple[str, list[dict[str, Any]], bool]]:
+            try:
+                result = await _execute_single_tool(inv, agent_state, tracer, agent_id)
+                return idx, result
+            except Exception as e:  # noqa: BLE001
+                # Return error result instead of raising
+                tool_name = inv.get("toolName", "unknown")
+                error_msg = f"Error executing {tool_name}: {type(e).__name__}: {e}"
+                error_xml = (
+                    f"<tool_result>\n<tool_name>{tool_name}</tool_name>\n"
+                    f"<result>{error_msg}</result>\n</tool_result>"
+                )
+                return idx, (error_xml, [], False)
+
+        batch_results = await asyncio.gather(
+            *[run_indexed(idx, inv) for idx, inv in parallel_batch],
+            return_exceptions=True
         )
+
+        for item in batch_results:
+            if isinstance(item, Exception):
+                # Should not happen with our try/except above, but handle anyway
+                logging.getLogger(__name__).error(f"Unexpected error in parallel batch: {item}")
+                continue
+            idx, result = item
+            results[idx] = result
+
+        parallel_batch = []
+
+    for idx, tool_inv in enumerate(tool_invocations):
+        tool_name = tool_inv.get("toolName", "unknown")
+
+        if _is_parallelizable(tool_name):
+            # Accumulate parallelizable tools
+            parallel_batch.append((idx, tool_inv))
+        else:
+            # Flush any pending parallel tools first
+            await execute_parallel_batch()
+            # Execute sequential tool immediately
+            result = await _execute_single_tool(tool_inv, agent_state, tracer, agent_id)
+            results[idx] = result
+
+    # Flush remaining parallel tools
+    await execute_parallel_batch()
+
+    # Collect results in original order
+    for idx in range(len(tool_invocations)):
+        observation_xml, images, tool_should_finish = results[idx]
         observation_parts.append(observation_xml)
         all_images.extend(images)
 

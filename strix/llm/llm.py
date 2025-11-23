@@ -17,9 +17,11 @@ from jinja2 import (
 from litellm import ModelResponse, completion_cost
 from litellm.utils import supports_prompt_caching
 
+from strix.llm.circuit_breaker import CircuitBreakerError, get_llm_circuit_breaker
 from strix.llm.config import LLMConfig
 from strix.llm.memory_compressor import MemoryCompressor
 from strix.llm.request_queue import get_global_queue
+from strix.llm.response_cache import get_global_cache
 from strix.llm.utils import _truncate_to_first_function, parse_tool_invocations
 from strix.prompts import load_prompt_modules
 from strix.tools import get_tools_prompt
@@ -339,6 +341,14 @@ class LLM:
                 model=self.config.model_name,
             )
 
+        # Check circuit breaker before attempting request
+        circuit_breaker = get_llm_circuit_breaker()
+        try:
+            circuit_breaker.raise_if_open()
+        except CircuitBreakerError as e:
+            self._emit_llm_error(tracer, request_id, start_time, str(e), "CircuitBreakerError")
+            raise LLMRequestFailedError(str(e), f"Retry in {e.time_until_retry:.1f}s") from e
+
         # Retry loop with exponential backoff for transient errors
         last_error: Exception | None = None
         retry_delay = INITIAL_RETRY_DELAY
@@ -347,6 +357,9 @@ class LLM:
             try:
                 response = await self._make_request(cached_messages)
                 self._update_usage_stats(response)
+
+                # Record success with circuit breaker
+                circuit_breaker.record_success()
 
                 # Emit LLM response event
                 duration_ms = (time.time() - start_time) * 1000
@@ -361,10 +374,12 @@ class LLM:
                         cached_tokens=self._last_request_stats.cached_tokens,
                     )
 
+                # Extract content with validation
                 content = ""
-                if (
-                    response.choices
-                    and hasattr(response.choices[0], "message")
+                if not response.choices:
+                    logger.warning("LLM returned empty choices, using empty content")
+                elif (
+                    hasattr(response.choices[0], "message")
                     and response.choices[0].message
                 ):
                     content = getattr(response.choices[0].message, "content", "") or ""
@@ -375,7 +390,13 @@ class LLM:
                     function_end_index = content.find("</function>") + len("</function>")
                     content = content[:function_end_index]
 
-                tool_invocations = parse_tool_invocations(content)
+                # Parse tool invocations with graceful degradation
+                tool_invocations = None
+                try:
+                    tool_invocations = parse_tool_invocations(content)
+                except Exception as e:  # noqa: BLE001
+                    logger.warning(f"Failed to parse tool invocations: {e}")
+                    # Continue with None tool_invocations - agent will handle text response
 
                 return LLMResponse(
                     scan_id=scan_id,
@@ -388,6 +409,9 @@ class LLM:
             except RETRYABLE_ERRORS as e:
                 last_error = e
                 error_type = type(e).__name__
+
+                # Record failure with circuit breaker (transient errors count)
+                circuit_breaker.record_failure(e)
 
                 if attempt < MAX_RETRIES:
                     # Log retry attempt
@@ -420,14 +444,15 @@ class LLM:
                 litellm.InvalidRequestError,
                 litellm.BadRequestError,
             ) as e:
-                # Non-retryable errors - fail immediately
+                # Non-retryable errors - fail immediately (don't affect circuit breaker)
                 error_type = type(e).__name__
                 error_msg = self._get_error_message(e)
                 self._emit_llm_error(tracer, request_id, start_time, error_msg, error_type, str(e))
                 raise LLMRequestFailedError(f"LLM request failed: {error_msg}", str(e)) from e
 
             except Exception as e:
-                # Unknown errors - fail immediately
+                # Unknown errors - record with circuit breaker and fail
+                circuit_breaker.record_failure(e)
                 error_type = type(e).__name__
                 self._emit_llm_error(tracer, request_id, start_time, str(e), error_type, str(e))
                 raise LLMRequestFailedError(f"LLM request failed: {error_type}", str(e)) from e
@@ -508,6 +533,23 @@ class LLM:
 
         return model_matches(self.config.model_name, REASONING_EFFORT_PATTERNS)
 
+    def _should_use_streaming(self) -> bool:
+        """Check if streaming should be used for this request."""
+        if not self.config.enable_streaming:
+            return False
+
+        # Some models don't support streaming well
+        if not self.config.model_name:
+            return False
+
+        # Disable streaming for reasoning models (they often don't support it well)
+        model_lower = self.config.model_name.lower()
+        no_stream_patterns = ["o1", "o3", "o4"]
+        if any(pat in model_lower for pat in no_stream_patterns):
+            return False
+
+        return True
+
     async def _make_request(
         self,
         messages: list[dict[str, Any]],
@@ -524,11 +566,79 @@ class LLM:
         if self._should_include_reasoning_effort():
             completion_args["reasoning_effort"] = "high"
 
+        # Check cache first
+        cache = get_global_cache()
+        cached_response = cache.get(
+            model=completion_args["model"],
+            messages=completion_args["messages"],
+        )
+        if cached_response is not None:
+            logger.debug("Using cached LLM response")
+            self._total_stats.requests += 1
+            self._last_request_stats = RequestStats(requests=1)
+            return cached_response
+
         queue = get_global_queue()
-        response = await queue.make_request(completion_args)
+
+        if self._should_use_streaming():
+            response = await self._make_streaming_request(queue, completion_args)
+        else:
+            response = await queue.make_request(completion_args)
+
+        # Cache the response
+        cache.put(
+            model=completion_args["model"],
+            messages=completion_args["messages"],
+            response=response,
+        )
 
         self._total_stats.requests += 1
         self._last_request_stats = RequestStats(requests=1)
+
+        return response
+
+    async def _make_streaming_request(
+        self,
+        queue: Any,
+        completion_args: dict[str, Any],
+    ) -> ModelResponse:
+        """Make a streaming request with early termination on </function> tag."""
+
+        def stop_on_function_end(content: str) -> bool:
+            return "</function>" in content
+
+        content, usage_chunk = await queue.make_streaming_request(
+            completion_args,
+            on_chunk=None,  # Could add callback for real-time display
+            stop_condition=stop_on_function_end,
+        )
+
+        # Build a synthetic ModelResponse from streamed content
+        # This maintains compatibility with the rest of the code
+        from litellm import ModelResponse as LiteLLMResponse
+        from litellm.utils import Usage, Choices, Message
+
+        message = Message(content=content, role="assistant")
+        choice = Choices(index=0, message=message, finish_reason="stop")
+
+        # Use usage from final chunk if available, otherwise estimate
+        if usage_chunk and hasattr(usage_chunk, "usage") and usage_chunk.usage:
+            usage = usage_chunk.usage
+        else:
+            # Estimate tokens (rough approximation)
+            usage = Usage(
+                prompt_tokens=0,  # Will be updated from actual response
+                completion_tokens=len(content) // 4,  # ~4 chars per token
+                total_tokens=len(content) // 4,
+            )
+
+        response = LiteLLMResponse(
+            id="stream-" + str(time.time()),
+            choices=[choice],
+            created=int(time.time()),
+            model=self.config.model_name,
+            usage=usage,
+        )
 
         return response
 

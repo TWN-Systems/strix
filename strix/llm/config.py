@@ -9,6 +9,7 @@ class LLMConfig:
         prompt_modules: list[str] | None = None,
         timeout: int | None = None,
         agent_role: str | None = None,
+        enable_streaming: bool | None = None,
     ):
         self.model_name = model_name or os.getenv("STRIX_LLM", "openai/gpt-5")
 
@@ -20,3 +21,9 @@ class LLMConfig:
         self.agent_role = agent_role
 
         self.timeout = timeout or int(os.getenv("LLM_TIMEOUT", "600"))
+
+        # Streaming enabled by default, can be disabled via env var
+        if enable_streaming is not None:
+            self.enable_streaming = enable_streaming
+        else:
+            self.enable_streaming = os.getenv("LLM_STREAMING", "true").lower() == "true"
