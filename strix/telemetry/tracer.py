@@ -1,3 +1,4 @@
+import json
 import logging
 from datetime import UTC, datetime
 from pathlib import Path
@@ -50,6 +51,7 @@ class Tracer:
         self._run_dir: Path | None = None
         self._next_execution_id = 1
         self._next_message_id = 1
+        self._next_llm_response_id = 1
         self._saved_vuln_ids: set[str] = set()
 
         self.vulnerability_found_callback: Callable[[str, str, str, str], None] | None = None
@@ -149,6 +151,69 @@ class Tracer:
 
         self.chat_messages.append(message_data)
         return message_id
+
+    def log_llm_response(
+        self,
+        agent_id: str,
+        agent_name: str,
+        content: str,
+        model: str | None = None,
+        input_tokens: int = 0,
+        output_tokens: int = 0,
+        cached_tokens: int = 0,
+        cost: float = 0.0,
+        tool_invocations: list[dict[str, Any]] | None = None,
+        iteration: int = 0,
+        error: str | None = None,
+    ) -> int:
+        """Log an LLM response to a JSON file in the run directory.
+
+        Each response is stored as a separate file for efficient storage and
+        retrieval. JSON format is used for structured data that can be easily
+        parsed for reconciliation.
+        """
+        response_id = self._next_llm_response_id
+        self._next_llm_response_id += 1
+
+        timestamp = datetime.now(UTC)
+        timestamp_str = timestamp.isoformat()
+        timestamp_file = timestamp.strftime("%Y%m%d_%H%M%S")
+
+        response_data = {
+            "response_id": response_id,
+            "agent_id": agent_id,
+            "agent_name": agent_name,
+            "iteration": iteration,
+            "timestamp": timestamp_str,
+            "model": model,
+            "content": content,
+            "tool_invocations": tool_invocations,
+            "usage": {
+                "input_tokens": input_tokens,
+                "output_tokens": output_tokens,
+                "cached_tokens": cached_tokens,
+                "cost": round(cost, 6),
+            },
+            "error": error,
+        }
+
+        try:
+            run_dir = self.get_run_dir()
+            responses_dir = run_dir / "llm_responses"
+            responses_dir.mkdir(exist_ok=True)
+
+            filename = f"{response_id:05d}_{timestamp_file}_{agent_name}.json"
+            response_file = responses_dir / filename
+
+            with response_file.open("w", encoding="utf-8") as f:
+                json.dump(response_data, f, indent=2, ensure_ascii=False)
+
+            logger.debug(f"Saved LLM response {response_id} to: {response_file}")
+
+        except (OSError, RuntimeError) as e:
+            logger.warning(f"Failed to save LLM response {response_id}: {e}")
+
+        return response_id
 
     def log_tool_execution_start(self, agent_id: str, tool_name: str, args: dict[str, Any]) -> int:
         execution_id = self._next_execution_id

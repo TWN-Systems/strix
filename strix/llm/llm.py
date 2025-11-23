@@ -414,6 +414,21 @@ class LLM:
 
         return response
 
+    def get_rate_limit_info(self) -> dict[str, Any]:
+        """Get rate limit information from the request queue."""
+        queue = get_global_queue()
+        return queue.get_rate_limit_info()
+
+    def get_queue_stats(self) -> dict[str, Any]:
+        """Get request queue statistics."""
+        queue = get_global_queue()
+        return queue.get_stats()
+
+    def is_rate_limited(self) -> bool:
+        """Check if we're currently rate limited."""
+        queue = get_global_queue()
+        return queue.rate_limit_state.is_rate_limited
+
     def _update_usage_stats(self, response: ModelResponse) -> None:
         try:
             if hasattr(response, "usage") and response.usage:

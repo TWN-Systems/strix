@@ -18,6 +18,7 @@ from strix.llm import LLM, LLMConfig, LLMRequestFailedError
 from strix.llm.utils import clean_content
 from strix.tools import process_tool_invocations
 
+from .reconciliation import StateReconciler
 from .state import AgentState
 
 
@@ -79,6 +80,9 @@ class BaseAgent(metaclass=AgentMeta):
         with contextlib.suppress(Exception):
             self.llm.set_agent_identity(self.agent_name, self.state.agent_id)
         self._current_task: asyncio.Task[Any] | None = None
+        self._reconciler = StateReconciler(self.state)
+        self._consecutive_failures: int = 0
+        self._last_reconciliation_iteration: int = 0
 
         from strix.telemetry.tracer import get_global_tracer
 
@@ -150,6 +154,42 @@ class BaseAgent(metaclass=AgentMeta):
             self._current_task.cancel()
             self._current_task = None
 
+    def _should_run_reconciliation(self) -> bool:
+        """Check if we should run a reconciliation check."""
+        iterations_since_last = self.state.iteration - self._last_reconciliation_iteration
+
+        if self._consecutive_failures >= 2:
+            return True
+
+        if iterations_since_last >= 50:
+            return True
+
+        if len(self.state.errors) >= 3:
+            recent_errors = self.state.errors[-3:]
+            if any("rate limit" in e.lower() or "429" in e.lower() for e in recent_errors):
+                return True
+
+        return False
+
+    def _run_reconciliation_check(self, tracer: Optional["Tracer"]) -> None:
+        """Run reconciliation check and inject message if issues found."""
+        issues = self._reconciler.check_for_issues()
+
+        if issues:
+            self._reconciler.auto_fix_issues()
+
+            critical_issues = [i for i in issues if i.severity in ("critical", "high")]
+            if critical_issues:
+                self._reconciler.inject_reconciliation_message(issues)
+
+                if tracer:
+                    run_dir = tracer.get_run_dir()
+                    recon_file = run_dir / f"reconciliation_{self.state.iteration:05d}.json"
+                    self._reconciler.save_reconciliation_state(str(recon_file))
+
+        self._last_reconciliation_iteration = self.state.iteration
+        self._consecutive_failures = 0
+
     async def agent_loop(self, task: str) -> dict[str, Any]:  # noqa: PLR0912, PLR0915
         await self._initialize_sandbox_and_state(task)
 
@@ -175,6 +215,9 @@ class BaseAgent(metaclass=AgentMeta):
                 continue
 
             self.state.increment_iteration()
+
+            if self._should_run_reconciliation():
+                self._run_reconciliation_check(tracer)
 
             if (
                 self.state.is_approaching_max_iterations()
@@ -224,6 +267,19 @@ class BaseAgent(metaclass=AgentMeta):
                 error_msg = str(e)
                 error_details = getattr(e, "details", None)
                 self.state.add_error(error_msg)
+                self._consecutive_failures += 1
+
+                is_rate_limit = "rate limit" in error_msg.lower() or "429" in str(error_details or "").lower()
+
+                if tracer:
+                    tracer.log_llm_response(
+                        agent_id=self.state.agent_id,
+                        agent_name=self.state.agent_name,
+                        content="",
+                        model=self.llm.config.model_name,
+                        iteration=self.state.iteration,
+                        error=error_msg,
+                    )
 
                 if self.non_interactive:
                     self.state.set_completed({"success": False, "error": error_msg})
@@ -233,7 +289,7 @@ class BaseAgent(metaclass=AgentMeta):
                             tracer.log_tool_execution_start(
                                 self.state.agent_id,
                                 "llm_error_details",
-                                {"error": error_msg, "details": error_details},
+                                {"error": error_msg, "details": error_details, "is_rate_limit": is_rate_limit},
                             )
                             tracer.update_tool_execution(
                                 tracer._next_execution_id - 1, "failed", error_details
@@ -247,7 +303,7 @@ class BaseAgent(metaclass=AgentMeta):
                         tracer.log_tool_execution_start(
                             self.state.agent_id,
                             "llm_error_details",
-                            {"error": error_msg, "details": error_details},
+                            {"error": error_msg, "details": error_details, "is_rate_limit": is_rate_limit},
                         )
                         tracer.update_tool_execution(
                             tracer._next_execution_id - 1, "failed", error_details
@@ -352,6 +408,21 @@ class BaseAgent(metaclass=AgentMeta):
 
     async def _process_iteration(self, tracer: Optional["Tracer"]) -> bool:
         response = await self.llm.generate(self.state.get_conversation_history())
+
+        if tracer:
+            usage_stats = self.llm.usage_stats.get("last_request", {})
+            tracer.log_llm_response(
+                agent_id=self.state.agent_id,
+                agent_name=self.state.agent_name,
+                content=response.content or "",
+                model=self.llm.config.model_name,
+                input_tokens=usage_stats.get("input_tokens", 0),
+                output_tokens=usage_stats.get("output_tokens", 0),
+                cached_tokens=usage_stats.get("cached_tokens", 0),
+                cost=usage_stats.get("cost", 0.0),
+                tool_invocations=response.tool_invocations,
+                iteration=self.state.iteration,
+            )
 
         content_stripped = (response.content or "").strip()
 
