@@ -46,8 +46,9 @@ services:
       # Mount pyproject.toml for dependency changes
       - ./pyproject.toml:/app/pyproject.toml:ro
       - ./poetry.lock:/app/poetry.lock:ro
-      # Output directory for scan results
+      # Output directories for scan results (mounted to host for easy access)
       - ./strix_runs:/app/strix_runs
+      - ./agent_runs:/app/agent_runs
 
     # Interactive terminal
     stdin_open: true
