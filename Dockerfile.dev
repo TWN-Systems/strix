@@ -1,0 +1,104 @@
+# =============================================================================
+# Strix Development Dockerfile
+# =============================================================================
+# Optimized for local development with Poetry, hot reloading, and volume mounts.
+# Use with docker-compose.dev.yml for the best development experience.
+# =============================================================================
+
+FROM python:3.12-slim
+
+LABEL maintainer="Strix <hi@usestrix.com>"
+LABEL description="Strix Development Environment"
+
+# Prevent Python from buffering stdout/stderr
+ENV PYTHONUNBUFFERED=1
+ENV PYTHONDONTWRITEBYTECODE=1
+
+# Set Poetry environment variables
+ENV POETRY_HOME="/opt/poetry"
+ENV POETRY_VIRTUALENVS_CREATE=true
+ENV POETRY_VIRTUALENVS_IN_PROJECT=true
+ENV POETRY_NO_INTERACTION=1
+ENV POETRY_VERSION=1.8.4
+
+# Add Poetry to PATH
+ENV PATH="$POETRY_HOME/bin:$PATH"
+
+# Install system dependencies
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    # Build essentials
+    build-essential \
+    gcc \
+    g++ \
+    # Git for version control
+    git \
+    # Curl for Poetry installation
+    curl \
+    # Required for some Python packages
+    libffi-dev \
+    libssl-dev \
+    # For Playwright browser automation
+    libnss3 \
+    libnspr4 \
+    libdbus-1-3 \
+    libatk1.0-0 \
+    libatk-bridge2.0-0 \
+    libcups2 \
+    libdrm2 \
+    libatspi2.0-0 \
+    libxcomposite1 \
+    libxdamage1 \
+    libxfixes3 \
+    libxrandr2 \
+    libgbm1 \
+    libxkbcommon0 \
+    libpango-1.0-0 \
+    libcairo2 \
+    libasound2 \
+    fonts-liberation \
+    # Useful dev tools
+    vim \
+    less \
+    jq \
+    tmux \
+    && apt-get clean \
+    && rm -rf /var/lib/apt/lists/*
+
+# Install Poetry
+RUN curl -sSL https://install.python-poetry.org | python3 -
+
+# Create non-root user for development
+RUN useradd -m -s /bin/bash developer \
+    && mkdir -p /app \
+    && chown -R developer:developer /app
+
+WORKDIR /app
+
+# Copy dependency files first for better layer caching
+COPY --chown=developer:developer pyproject.toml poetry.lock* ./
+
+# Switch to non-root user
+USER developer
+
+# Install dependencies (without the project itself for caching)
+RUN poetry install --no-root --with dev
+
+# Install Playwright browsers
+RUN poetry run playwright install chromium
+
+# Copy the rest of the application (this layer changes frequently)
+# In development, this is typically overridden by volume mounts
+COPY --chown=developer:developer . .
+
+# Install the project in editable mode
+RUN poetry install --with dev
+
+# Set Python path for imports
+ENV PYTHONPATH=/app
+
+# Default command for development
+CMD ["poetry", "run", "python", "-m", "strix.interface.main"]
+
+# Health check
+HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
+    CMD poetry run python -c "import strix; print('healthy')" || exit 1

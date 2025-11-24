@@ -1,0 +1,89 @@
+# =============================================================================
+# Strix Development Docker Compose
+# =============================================================================
+# Local development environment with hot reloading and volume mounts.
+#
+# Usage:
+#   docker compose -f docker-compose.dev.yml up --build
+#   docker compose -f docker-compose.dev.yml run --rm strix-dev bash
+#
+# For running tests:
+#   docker compose -f docker-compose.dev.yml run --rm strix-dev poetry run pytest
+#
+# For linting:
+#   docker compose -f docker-compose.dev.yml run --rm strix-dev poetry run ruff check .
+# =============================================================================
+
+services:
+  strix-dev:
+    build:
+      context: .
+      dockerfile: Dockerfile.dev
+    container_name: strix-dev
+
+    # Environment variables
+    env_file:
+      - .env
+
+    environment:
+      # Development-specific overrides
+      - DEBUG=true
+      - PYTHONUNBUFFERED=1
+      - PYTHONPATH=/app
+      # Disable sandbox mode for local development
+      - STRIX_SANDBOX_MODE=false
+
+    # Volume mounts for hot reloading
+    volumes:
+      # Mount source code for live editing
+      - ./strix:/app/strix:cached
+      # Mount tests for development
+      - ./tests:/app/tests:cached
+      # Mount prompts for easy editing
+      - ./strix/prompts:/app/strix/prompts:cached
+      # Persist Poetry virtual environment
+      - strix-venv:/app/.venv
+      # Mount pyproject.toml for dependency changes
+      - ./pyproject.toml:/app/pyproject.toml:ro
+      - ./poetry.lock:/app/poetry.lock:ro
+      # Output directory for scan results
+      - ./strix_runs:/app/strix_runs
+
+    # Interactive terminal
+    stdin_open: true
+    tty: true
+
+    # Network configuration
+    networks:
+      - strix-network
+
+    # Resource limits for development
+    deploy:
+      resources:
+        limits:
+          memory: 4G
+        reservations:
+          memory: 1G
+
+  # Optional: Redis for caching (if needed in future)
+  # redis:
+  #   image: redis:7-alpine
+  #   container_name: strix-redis
+  #   ports:
+  #     - "6379:6379"
+  #   networks:
+  #     - strix-network
+  #   volumes:
+  #     - redis-data:/data
+
+# Named volumes for persistence
+volumes:
+  strix-venv:
+    driver: local
+  # redis-data:
+  #   driver: local
+
+# Network for service communication
+networks:
+  strix-network:
+    driver: bridge

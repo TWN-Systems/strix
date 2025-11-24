@@ -97,3 +97,13 @@ Thumbs.db
 schema.graphql
 
 .opencode/
+
+# Docker
+docker-compose.override.yml
+docker-compose.*.local.yml
+.docker/
+
+# Development environment
+.env.local
+.env.*.local
+!.env.example
