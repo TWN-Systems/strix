@@ -36,6 +36,14 @@ Strix is an AI-powered autonomous penetration testing agent that conducts securi
 | 12 | [Scan Result Persistence](12-scan-result-persistence.md) | Telemetry, vulnerability reports, output files |
 | 13 | [Scope System Architecture](13-scope-system-architecture.md) | Scope models, parser, validator, telemetry, role-based access, progress |
 
+### Threat Intelligence & Adaptive Scanning
+
+| # | Diagram | Description |
+|---|---------|-------------|
+| 14 | [OWASP Top 10 Integration](14-owasp-top10-integration.md) | OWASP Web/API/LLM/MCP Top 10 mapping, report generation |
+| 15 | [Target Complexity Index](15-target-complexity-index.md) | TCI calculation, fingerprint analysis, adaptive scanning |
+| 16 | [MITRE ATT&CK Integration](16-mitre-attack-integration.md) | TTP mapping, attack chain construction, threat intelligence |
+
 ## Architecture Overview
 
 ```mermaid
@@ -48,13 +56,24 @@ flowchart TB
         Root[Root Agent]
         Discovery[Discovery Agents]
         Validation[Validation Agents]
+        Planner[Scan Planner]
         Root --> Discovery
         Root --> Validation
+        Root --> Planner
     end
 
     subgraph LLM Layer
         LLM[LiteLLM / OpenAI]
         Prompts[Prompt Modules]
+    end
+
+    subgraph Threat Intelligence
+        TCI[Target Complexity Index]
+        OWASP[OWASP Top 10]
+        MITRE[MITRE ATT&CK]
+        Planner --> TCI
+        Discovery --> OWASP
+        Discovery --> MITRE
     end
 
     subgraph Tool Layer
@@ -90,6 +109,8 @@ flowchart TB
     Root --> Tracer
     Tracer --> Reports
     Tracer --> Storage
+    Reports --> OWASP
+    Reports --> MITRE
 ```
 
 ## Key Concepts
@@ -106,6 +127,11 @@ Specialized knowledge injected into agent prompts:
 - **Framework Modules**: `fastapi`, `nextjs`
 - **Protocol Modules**: `graphql`
 - **Technology Modules**: `firebase_firestore`, `supabase`
+
+### Threat Intelligence Integration
+- **OWASP Top 10**: Four standards (Web, API, LLM, MCP) for vulnerability classification
+- **MITRE ATT&CK**: TTP mapping for 70+ techniques across 14 tactics
+- **TCI (Target Complexity Index)**: Adaptive scanning based on target fingerprint analysis
 
 ### Sandbox Environment
 Isolated Docker container providing:
