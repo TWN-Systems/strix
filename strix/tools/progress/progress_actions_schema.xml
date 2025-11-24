@@ -1,0 +1,87 @@
+<tool name="save_progress">
+  <description>
+    Save a progress checkpoint to disk for scan resumption or tracking.
+    Use this to save intermediate results, findings, or state that should persist.
+  </description>
+  <parameters>
+    <parameter name="checkpoint_name" type="string" required="true">
+      Name for this checkpoint (e.g., "recon_complete", "auth_testing_done", "phase_1").
+      Should be descriptive and unique within the scan.
+    </parameter>
+    <parameter name="data" type="object" required="true">
+      Progress data to save. Can include:
+      - findings: List of discovered vulnerabilities or issues
+      - state: Current scan state (e.g., tested endpoints)
+      - context: Any relevant context for resumption
+    </parameter>
+    <parameter name="metadata" type="object" required="false">
+      Optional metadata about the checkpoint:
+      - phase: Current scan phase
+      - agent_id: ID of the agent saving progress
+      - description: Human-readable description
+    </parameter>
+  </parameters>
+  <returns>
+    Status object with checkpoint file path and creation time.
+  </returns>
+  <examples>
+    <example>
+      <description>Save reconnaissance findings</description>
+      <invocation>
+        save_progress(
+          checkpoint_name="recon_complete",
+          data={
+            "subdomains": ["api.example.com", "admin.example.com"],
+            "open_ports": [80, 443, 8080],
+            "technologies": ["nginx", "Django"]
+          },
+          metadata={"phase": "reconnaissance", "description": "Initial recon complete"}
+        )
+      </invocation>
+    </example>
+  </examples>
+</tool>
+
+<tool name="load_progress">
+  <description>
+    Load a previously saved progress checkpoint.
+    Use this to resume a scan or retrieve previous findings.
+  </description>
+  <parameters>
+    <parameter name="checkpoint_name" type="string" required="true">
+      Name of the checkpoint to load.
+    </parameter>
+  </parameters>
+  <returns>
+    The checkpoint data including saved data and metadata, or error if not found.
+  </returns>
+  <examples>
+    <example>
+      <description>Load previous reconnaissance results</description>
+      <invocation>
+        load_progress(checkpoint_name="recon_complete")
+      </invocation>
+    </example>
+  </examples>
+</tool>
+
+<tool name="list_progress">
+  <description>
+    List all available progress checkpoints for the current scan.
+    Use this to see what checkpoints exist before loading.
+  </description>
+  <parameters>
+    <!-- No parameters required -->
+  </parameters>
+  <returns>
+    List of available checkpoints with their names, creation times, and file sizes.
+  </returns>
+  <examples>
+    <example>
+      <description>List all saved checkpoints</description>
+      <invocation>
+        list_progress()
+      </invocation>
+    </example>
+  </examples>
+</tool>

@@ -1,5 +1,8 @@
+import json
 import logging
+from dataclasses import dataclass, field
 from datetime import UTC, datetime
+from enum import Enum
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Optional
 from uuid import uuid4
@@ -23,6 +26,83 @@ def set_global_tracer(tracer: "Tracer") -> None:
     _global_tracer = tracer
 
 
+class EventType(str, Enum):
+    """Types of events that can be emitted by the tracer."""
+
+    # Scan lifecycle events
+    SCAN_START = "scan_start"
+    SCAN_END = "scan_end"
+    SCAN_ERROR = "scan_error"
+
+    # Agent lifecycle events
+    AGENT_CREATED = "agent_created"
+    AGENT_ITERATION = "agent_iteration"
+    AGENT_COMPLETED = "agent_completed"
+    AGENT_ERROR = "agent_error"
+
+    # LLM events
+    LLM_REQUEST = "llm_request"
+    LLM_RESPONSE = "llm_response"
+    LLM_ERROR = "llm_error"
+
+    # Tool events
+    TOOL_START = "tool_start"
+    TOOL_END = "tool_end"
+    TOOL_ERROR = "tool_error"
+
+    # Vulnerability events
+    VULNERABILITY_FOUND = "vulnerability_found"
+    VULNERABILITY_VERIFIED = "vulnerability_verified"
+
+    # Progress events
+    PROGRESS_UPDATE = "progress_update"
+    PHASE_CHANGE = "phase_change"
+
+    # Scope events
+    SCOPE_LOADED = "scope_loaded"
+    SCOPE_TARGET_START = "scope_target_start"
+    SCOPE_TARGET_END = "scope_target_end"
+
+
+@dataclass
+class TracerEvent:
+    """A single event in the tracer event stream."""
+
+    event_id: str
+    event_type: EventType
+    timestamp: str
+    agent_id: str | None = None
+    data: dict[str, Any] = field(default_factory=dict)
+    metadata: dict[str, Any] = field(default_factory=dict)
+
+    def to_dict(self) -> dict[str, Any]:
+        """Convert event to dictionary."""
+        return {
+            "event_id": self.event_id,
+            "event_type": self.event_type.value,
+            "timestamp": self.timestamp,
+            "agent_id": self.agent_id,
+            "data": self.data,
+            "metadata": self.metadata,
+        }
+
+    def to_json(self) -> str:
+        """Convert event to JSON string."""
+        return json.dumps(self.to_dict())
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> "TracerEvent":
+        """Create event from dictionary."""
+        return cls(
+            event_id=data["event_id"],
+            event_type=EventType(data["event_type"]),
+            timestamp=data["timestamp"],
+            agent_id=data.get("agent_id"),
+            data=data.get("data", {}),
+            metadata=data.get("metadata", {}),
+        )
+
+
 class Tracer:
     def __init__(self, run_name: str | None = None):
         self.run_name = run_name
@@ -39,6 +119,7 @@ class Tracer:
 
         self.scan_results: dict[str, Any] | None = None
         self.scan_config: dict[str, Any] | None = None
+        self.scope_context: dict[str, Any] | None = None
         self.run_metadata: dict[str, Any] = {
             "run_id": self.run_id,
             "run_name": self.run_name,
@@ -50,9 +131,222 @@ class Tracer:
         self._run_dir: Path | None = None
         self._next_execution_id = 1
         self._next_message_id = 1
+        self._next_event_id = 1
         self._saved_vuln_ids: set[str] = set()
 
+        # Event streaming
+        self._events: list[TracerEvent] = []
+        self._event_cursor: int = 0
+        self._event_callbacks: list[Callable[[TracerEvent], None]] = []
+        self._events_file: Path | None = None
+
         self.vulnerability_found_callback: Callable[[str, str, str, str], None] | None = None
+
+    def add_event_callback(self, callback: Callable[[TracerEvent], None]) -> None:
+        """Add a callback to be invoked for each new event."""
+        self._event_callbacks.append(callback)
+
+    def remove_event_callback(self, callback: Callable[[TracerEvent], None]) -> None:
+        """Remove an event callback."""
+        if callback in self._event_callbacks:
+            self._event_callbacks.remove(callback)
+
+    def _emit_event(
+        self,
+        event_type: EventType,
+        agent_id: str | None = None,
+        data: dict[str, Any] | None = None,
+        metadata: dict[str, Any] | None = None,
+    ) -> TracerEvent:
+        """Emit a new event to the event stream."""
+        event_id = f"evt-{self._next_event_id:06d}"
+        self._next_event_id += 1
+
+        event = TracerEvent(
+            event_id=event_id,
+            event_type=event_type,
+            timestamp=datetime.now(UTC).isoformat(),
+            agent_id=agent_id,
+            data=data or {},
+            metadata=metadata or {},
+        )
+
+        self._events.append(event)
+
+        # Invoke callbacks
+        for callback in self._event_callbacks:
+            try:
+                callback(event)
+            except Exception as e:
+                logger.warning(f"Event callback error: {e}")
+
+        # Persist to JSONL file
+        self._persist_event(event)
+
+        return event
+
+    def _persist_event(self, event: TracerEvent) -> None:
+        """Persist event to JSONL file."""
+        try:
+            if self._events_file is None:
+                run_dir = self.get_run_dir()
+                self._events_file = run_dir / "events.jsonl"
+
+            with self._events_file.open("a", encoding="utf-8") as f:
+                f.write(event.to_json() + "\n")
+        except (OSError, RuntimeError) as e:
+            logger.warning(f"Failed to persist event: {e}")
+
+    def get_events(self, since_cursor: int | None = None) -> list[TracerEvent]:
+        """Get events, optionally since a cursor position."""
+        if since_cursor is None:
+            return self._events.copy()
+        return self._events[since_cursor:]
+
+    def get_event_cursor(self) -> int:
+        """Get the current event cursor position."""
+        return len(self._events)
+
+    def get_events_by_type(self, event_type: EventType) -> list[TracerEvent]:
+        """Get all events of a specific type."""
+        return [e for e in self._events if e.event_type == event_type]
+
+    def get_events_by_agent(self, agent_id: str) -> list[TracerEvent]:
+        """Get all events for a specific agent."""
+        return [e for e in self._events if e.agent_id == agent_id]
+
+    def log_scan_start(self, config: dict[str, Any]) -> None:
+        """Log scan start event."""
+        self._emit_event(
+            EventType.SCAN_START,
+            data={
+                "run_id": self.run_id,
+                "config": config,
+            },
+        )
+
+    def log_scan_end(self, success: bool = True, error: str | None = None) -> None:
+        """Log scan end event."""
+        self._emit_event(
+            EventType.SCAN_END,
+            data={
+                "success": success,
+                "error": error,
+                "vulnerabilities_found": len(self.vulnerability_reports),
+            },
+        )
+
+    def log_agent_iteration(
+        self,
+        agent_id: str,
+        iteration: int,
+        action: str | None = None,
+    ) -> None:
+        """Log an agent iteration event."""
+        self._emit_event(
+            EventType.AGENT_ITERATION,
+            agent_id=agent_id,
+            data={
+                "iteration": iteration,
+                "action": action,
+            },
+        )
+
+    def log_llm_request(
+        self,
+        agent_id: str,
+        model: str,
+        messages_count: int,
+        tokens_estimate: int | None = None,
+    ) -> str:
+        """Log an LLM request event. Returns event_id for correlation."""
+        event = self._emit_event(
+            EventType.LLM_REQUEST,
+            agent_id=agent_id,
+            data={
+                "model": model,
+                "messages_count": messages_count,
+                "tokens_estimate": tokens_estimate,
+            },
+        )
+        return event.event_id
+
+    def log_llm_response(
+        self,
+        agent_id: str,
+        request_event_id: str,
+        input_tokens: int,
+        output_tokens: int,
+        cached_tokens: int = 0,
+        duration_ms: int | None = None,
+    ) -> None:
+        """Log an LLM response event."""
+        self._emit_event(
+            EventType.LLM_RESPONSE,
+            agent_id=agent_id,
+            data={
+                "request_event_id": request_event_id,
+                "input_tokens": input_tokens,
+                "output_tokens": output_tokens,
+                "cached_tokens": cached_tokens,
+                "duration_ms": duration_ms,
+            },
+        )
+
+    def log_tool_event(
+        self,
+        event_type: EventType,
+        agent_id: str,
+        tool_name: str,
+        execution_id: int | None = None,
+        args: dict[str, Any] | None = None,
+        result: Any | None = None,
+        error: str | None = None,
+        duration_ms: int | None = None,
+    ) -> None:
+        """Log a tool-related event."""
+        self._emit_event(
+            event_type,
+            agent_id=agent_id,
+            data={
+                "tool_name": tool_name,
+                "execution_id": execution_id,
+                "args": args,
+                "result": result if result is not None else None,
+                "error": error,
+                "duration_ms": duration_ms,
+            },
+        )
+
+    def log_scope_loaded(self, scope_context: dict[str, Any]) -> None:
+        """Log scope loaded event."""
+        self.scope_context = scope_context
+        self._emit_event(
+            EventType.SCOPE_LOADED,
+            data={
+                "engagement_name": scope_context.get("metadata", {}).get("engagement_name"),
+                "targets_count": len(scope_context.get("targets", [])),
+                "networks_count": len(scope_context.get("networks", [])),
+            },
+        )
+
+    def log_progress_update(
+        self,
+        agent_id: str | None,
+        phase: str,
+        progress: float,
+        message: str | None = None,
+    ) -> None:
+        """Log a progress update event."""
+        self._emit_event(
+            EventType.PROGRESS_UPDATE,
+            agent_id=agent_id,
+            data={
+                "phase": phase,
+                "progress": progress,
+                "message": message,
+            },
+        )
 
     def set_run_name(self, run_name: str) -> None:
         self.run_name = run_name
