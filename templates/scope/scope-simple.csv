@@ -1,0 +1,8 @@
+type,target,name,network,ports,tags,focus_areas,credentials_env
+infrastructure,10.0.10.5,Web Server,Production,22;80;443,web;production,,
+infrastructure,10.0.10.6,Database Server,Production,22;3306;5432,database;critical,,
+web_application,https://app.example.com,Main Application,DMZ,,customer-facing,authentication;idor,APP_TEST_USER:APP_TEST_PASS
+web_application,https://admin.example.com,Admin Panel,DMZ,,admin;critical,authentication;business_logic,ADMIN_USER:ADMIN_PASS
+api,https://api.example.com,REST API,DMZ,,api,sql_injection;idor,API_TOKEN
+repository,https://github.com/example/backend,Backend Code,,,code,sql_injection;secrets,
+local_code,./frontend,Frontend Code,,,code,xss;csrf,

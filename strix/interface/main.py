@@ -33,6 +33,12 @@ from strix.interface.utils import (
     validate_llm_response,
 )
 from strix.runtime.docker_runtime import STRIX_IMAGE
+from strix.scope import (
+    ScopeParseError,
+    TargetType as ScopeTargetType,
+    load_scope,
+    validate_scope,
+)
 from strix.telemetry.tracer import get_global_tracer
 
 
@@ -273,6 +279,11 @@ Examples:
   # Custom instructions (from file)
   strix --target example.com --instruction ./instructions.txt
   strix --target https://app.com --instruction /path/to/detailed_instructions.md
+
+  # Using scope files
+  strix --scope ./scope.yaml
+  strix --scope ./scope.yaml --filter "tags:critical"
+  strix --scope ./scope.yaml --validate
         """,
     )
 
@@ -280,11 +291,50 @@ Examples:
         "-t",
         "--target",
         type=str,
-        required=True,
         action="append",
         help="Target to test (URL, repository, local directory path, domain name, or IP address). "
-        "Can be specified multiple times for multi-target scans.",
+        "Can be specified multiple times for multi-target scans. "
+        "Required unless --scope is provided.",
     )
+
+    parser.add_argument(
+        "-s",
+        "--scope",
+        type=str,
+        help="Path to a scope configuration file (YAML, JSON, or CSV). "
+        "Defines targets, networks, credentials, and exclusions for the engagement.",
+    )
+
+    parser.add_argument(
+        "-f",
+        "--filter",
+        type=str,
+        action="append",
+        help="Filter targets from scope file. Format: 'field:value'. "
+        "Examples: 'tags:critical', 'type:web_application', 'network:DMZ'. "
+        "Can be specified multiple times for multiple filters.",
+    )
+
+    parser.add_argument(
+        "--validate",
+        action="store_true",
+        help="Validate the scope file and exit without running tests. "
+        "Useful for checking scope configuration before an engagement.",
+    )
+
+    parser.add_argument(
+        "-v",
+        "--verbose",
+        action="store_true",
+        help="Enable verbose output with additional details.",
+    )
+
+    parser.add_argument(
+        "--debug",
+        action="store_true",
+        help="Enable debug mode with detailed logging.",
+    )
+
     parser.add_argument(
         "--instruction",
         type=str,
@@ -316,6 +366,10 @@ Examples:
 
     args = parser.parse_args()
 
+    # Require either --target or --scope
+    if not args.target and not args.scope:
+        parser.error("Either --target or --scope is required")
+
     if args.instruction:
         instruction_path = Path(args.instruction)
         if instruction_path.exists() and instruction_path.is_file():
@@ -327,25 +381,180 @@ Examples:
             except Exception as e:  # noqa: BLE001
                 parser.error(f"Failed to read instruction file '{instruction_path}': {e}")
 
-    args.targets_info = []
-    for target in args.target:
+    # Initialize scope context
+    args.scope_config = None
+    args.scope_context = None
+
+    # Process scope file if provided
+    if args.scope:
         try:
-            target_type, target_dict = infer_target_type(target)
+            args.scope_config = load_scope(args.scope)
+            args.scope_context = {
+                "metadata": args.scope_config.metadata.model_dump(),
+                "settings": args.scope_config.settings.model_dump(),
+                "networks": [n.model_dump() for n in args.scope_config.networks],
+                "exclusions": args.scope_config.exclusions.model_dump(),
+                "domains": args.scope_config.domains.model_dump(),
+                "test_focus": args.scope_config.test_focus.model_dump(),
+            }
+        except ScopeParseError as e:
+            parser.error(f"Failed to parse scope file: {e}")
 
-            if target_type == "local_code":
-                display_target = target_dict.get("target_path", target)
-            else:
-                display_target = target
+    args.targets_info = []
 
-            args.targets_info.append(
-                {"type": target_type, "details": target_dict, "original": display_target}
-            )
-        except ValueError:
-            parser.error(f"Invalid target '{target}'")
+    # Process scope targets if scope file provided
+    if args.scope_config:
+        targets = args.scope_config.targets
+
+        # Apply filters if specified
+        if args.filter:
+            targets = _apply_scope_filters(targets, args.filter)
+
+        for target in targets:
+            target_info = _scope_target_to_target_info(target)
+            args.targets_info.append(target_info)
+
+    # Process command-line targets
+    if args.target:
+        for target in args.target:
+            try:
+                target_type, target_dict = infer_target_type(target)
+
+                if target_type == "local_code":
+                    display_target = target_dict.get("target_path", target)
+                else:
+                    display_target = target
+
+                args.targets_info.append(
+                    {"type": target_type, "details": target_dict, "original": display_target}
+                )
+            except ValueError:
+                parser.error(f"Invalid target '{target}'")
+
+    if not args.targets_info:
+        parser.error("No valid targets found")
 
     assign_workspace_subdirs(args.targets_info)
 
     return args
+
+
+def _apply_scope_filters(
+    targets: list, filters: list[str]
+) -> list:
+    """Apply filters to scope targets."""
+    result = targets
+
+    for filter_str in filters:
+        if ":" not in filter_str:
+            continue
+
+        field, value = filter_str.split(":", 1)
+        field = field.strip().lower()
+        value = value.strip()
+
+        if field == "tags":
+            result = [t for t in result if value in t.tags]
+        elif field == "type":
+            try:
+                target_type = ScopeTargetType(value)
+                result = [t for t in result if t.type == target_type]
+            except ValueError:
+                pass
+        elif field == "network":
+            result = [t for t in result if t.network == value]
+        elif field == "critical":
+            is_critical = value.lower() in ("true", "1", "yes")
+            result = [t for t in result if t.critical == is_critical]
+        elif field == "name":
+            result = [t for t in result if value.lower() in t.name.lower()]
+
+    return result
+
+
+def _scope_target_to_target_info(target) -> dict:
+    """Convert a scope TargetDefinition to target_info dict."""
+    # Determine target type string
+    type_mapping = {
+        ScopeTargetType.INFRASTRUCTURE: "infrastructure",
+        ScopeTargetType.WEB_APPLICATION: "web_application",
+        ScopeTargetType.API: "api",
+        ScopeTargetType.REPOSITORY: "repository",
+        ScopeTargetType.LOCAL_CODE: "local_code",
+    }
+    target_type = type_mapping.get(target.type, "infrastructure")
+
+    # Build details dict based on target type
+    details = {}
+    original = target.name
+
+    if target.host:
+        details["target_ip"] = target.host
+        original = target.host
+    elif target.url:
+        details["target_url"] = target.url
+        original = target.url
+    elif target.repo:
+        details["target_repo"] = target.repo
+        original = target.repo
+    elif target.path:
+        details["target_path"] = str(Path(target.path).resolve())
+        original = target.path
+
+    # Add ports for infrastructure targets
+    if target.ports:
+        details["ports"] = target.ports
+
+    # Add credentials info (env var references, not actual values)
+    if target.credentials:
+        details["credentials"] = [
+            {
+                "username": c.username,
+                "password_env": c.password_env,
+                "token_env": c.token_env,
+                "access_level": c.access_level.value,
+            }
+            for c in target.credentials
+        ]
+
+    # Add token env
+    if target.token_env:
+        details["token_env"] = target.token_env
+
+    # Add technologies
+    if target.technologies:
+        details["technologies"] = target.technologies
+
+    # Add focus areas
+    if target.focus_areas:
+        details["focus_areas"] = target.focus_areas
+
+    # Add modules
+    if target.modules:
+        details["modules"] = target.modules
+
+    # Add tags
+    if target.tags:
+        details["tags"] = target.tags
+
+    # Add services
+    if target.services:
+        details["services"] = [
+            {
+                "port": s.port,
+                "service": s.service,
+                "version": s.version,
+            }
+            for s in target.services
+        ]
+
+    return {
+        "type": target_type,
+        "details": details,
+        "original": original,
+        "name": target.name,
+        "scope_target": target.model_dump(),
+    }
 
 
 def display_completion_message(args: argparse.Namespace, results_path: Path) -> None:
@@ -463,11 +672,96 @@ def pull_docker_image() -> None:
     console.print()
 
 
+def _run_scope_validation(args: argparse.Namespace) -> None:
+    """Run scope validation and display results."""
+    console = Console()
+
+    if not args.scope_config:
+        console.print("[bold red]Error:[/] No scope file provided for validation")
+        sys.exit(1)
+
+    console.print()
+    console.print("[bold cyan]Validating scope configuration...[/]")
+    console.print()
+
+    result = validate_scope(args.scope_config)
+
+    # Display results
+    if result.is_valid:
+        status_text = Text()
+        status_text.append("PASSED", style="bold green")
+    else:
+        status_text = Text()
+        status_text.append("FAILED", style="bold red")
+
+    summary_text = Text()
+    summary_text.append("Validation Status: ", style="bold")
+    summary_text.append(status_text)
+    summary_text.append(f"\n\nErrors: {result.errors_count}", style="red" if result.errors_count else "dim")
+    summary_text.append(f"\nWarnings: {result.warnings_count}", style="yellow" if result.warnings_count else "dim")
+
+    # Show issues
+    if result.issues:
+        summary_text.append("\n\n")
+        summary_text.append("Issues Found:", style="bold")
+
+        for issue in result.issues:
+            if issue.severity.value == "error":
+                style = "red"
+                prefix = "ERROR"
+            elif issue.severity.value == "warning":
+                style = "yellow"
+                prefix = "WARN"
+            else:
+                style = "dim"
+                prefix = "INFO"
+
+            summary_text.append(f"\n  [{prefix}] ", style=style)
+            if issue.location:
+                summary_text.append(f"{issue.location}: ", style="dim")
+            summary_text.append(issue.message)
+            if issue.suggestion:
+                summary_text.append(f"\n         Suggestion: {issue.suggestion}", style="dim")
+
+    # Show scope summary
+    config = args.scope_config
+    scope_info = Text()
+    scope_info.append("\n\nScope Summary:", style="bold")
+    scope_info.append(f"\n  Engagement: {config.metadata.engagement_name}")
+    scope_info.append(f"\n  Type: {config.metadata.engagement_type.value}")
+    scope_info.append(f"\n  Networks: {len(config.networks)}")
+    scope_info.append(f"\n  Targets: {len(config.targets)}")
+    scope_info.append(f"\n  Mode: {config.settings.operational_mode.value}")
+
+    panel = Panel(
+        Text.assemble(summary_text, scope_info),
+        title="[bold cyan]Scope Validation Results",
+        border_style="green" if result.is_valid else "red",
+        padding=(1, 2),
+    )
+
+    console.print(panel)
+    console.print()
+
+    sys.exit(0 if result.is_valid else 1)
+
+
 def main() -> None:
     if sys.platform == "win32":
         asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
 
     args = parse_arguments()
+
+    # Set up logging based on flags
+    if args.debug:
+        logging.getLogger().setLevel(logging.DEBUG)
+    elif args.verbose:
+        logging.getLogger().setLevel(logging.INFO)
+
+    # Handle validation-only mode
+    if args.validate:
+        _run_scope_validation(args)
+        return
 
     check_docker_installed()
     pull_docker_image()
@@ -476,7 +770,11 @@ def main() -> None:
     asyncio.run(warm_up_llm())
 
     if not args.run_name:
-        args.run_name = generate_run_name(args.targets_info)
+        if args.scope_config:
+            # Use engagement name from scope for run name
+            args.run_name = generate_run_name(args.targets_info)
+        else:
+            args.run_name = generate_run_name(args.targets_info)
 
     for target_info in args.targets_info:
         if target_info["type"] == "repository":

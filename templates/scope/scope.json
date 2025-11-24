@@ -1,0 +1,88 @@
+{
+  "metadata": {
+    "engagement_name": "Example Engagement",
+    "engagement_type": "internal",
+    "start_date": "2024-01-01",
+    "end_date": "2024-01-31",
+    "tester": "your-name",
+    "notes": "Additional engagement notes"
+  },
+  "settings": {
+    "operational_mode": "poc-only",
+    "max_agents": 20,
+    "require_validation": true,
+    "generate_fixes": false
+  },
+  "networks": [
+    {
+      "name": "Production Network",
+      "type": "internal",
+      "vlan": 10,
+      "cidr": "10.0.10.0/24",
+      "gateway": "10.0.10.1",
+      "description": "Production servers"
+    },
+    {
+      "name": "DMZ",
+      "type": "external",
+      "cidr": "203.0.113.0/24",
+      "description": "Public-facing servers"
+    }
+  ],
+  "targets": [
+    {
+      "host": "10.0.10.5",
+      "name": "Web Server",
+      "type": "infrastructure",
+      "network": "Production Network",
+      "ports": [22, 80, 443],
+      "tags": ["web", "production"]
+    },
+    {
+      "url": "https://app.example.com",
+      "name": "Main Application",
+      "type": "web_application",
+      "network": "DMZ",
+      "technologies": ["Django", "PostgreSQL"],
+      "credentials": [
+        {
+          "username": "testuser",
+          "password_env": "APP_TEST_PASSWORD",
+          "access_level": "user"
+        }
+      ],
+      "focus_areas": ["authentication", "idor"],
+      "tags": ["customer-facing"]
+    },
+    {
+      "url": "https://api.example.com",
+      "name": "REST API",
+      "type": "api",
+      "auth_type": "bearer",
+      "token_env": "API_TOKEN",
+      "openapi_spec": "./api-spec.yaml",
+      "tags": ["api"]
+    },
+    {
+      "repo": "https://github.com/example/app",
+      "name": "Application Source",
+      "type": "repository",
+      "branch": "main",
+      "focus_areas": ["sql_injection", "secrets"]
+    }
+  ],
+  "exclusions": {
+    "hosts": ["10.0.10.1", "10.0.10.254"],
+    "cidrs": ["10.0.20.0/24"],
+    "urls": [
+      "https://app.example.com/health",
+      "https://app.example.com/metrics"
+    ],
+    "paths": ["/api/v1/internal/*"],
+    "ports": [161, 162]
+  },
+  "domains": {
+    "in_scope": ["*.example.com", "*.example-staging.com"],
+    "out_of_scope": ["mail.example.com", "vpn.example.com"]
+  }
+}

@@ -1,0 +1,116 @@
+# Strix Scope Configuration - Proxmox Cluster Security Assessment
+#
+# This template is specifically designed for assessing Proxmox VE clusters.
+# It includes common test focus areas and Proxmox-specific configurations.
+
+metadata:
+  engagement_name: "Proxmox Cluster Security Assessment"
+  engagement_type: "internal"
+  tester: "your-name"
+
+settings:
+  operational_mode: "recon-only"  # Start with recon, escalate as needed
+  require_validation: true
+
+networks:
+  - name: "Proxmox Management"
+    type: "internal"
+    vlan: 101
+    cidr: "10.0.101.0/24"
+    gateway: "10.0.101.1"
+    description: "Proxmox cluster management network"
+
+  - name: "VM Network"
+    type: "internal"
+    vlan: 102
+    cidr: "10.0.102.0/24"
+    description: "Virtual machine network"
+
+  - name: "Storage Network"
+    type: "internal"
+    vlan: 103
+    cidr: "10.0.103.0/24"
+    description: "Ceph/storage cluster network"
+
+targets:
+  # Primary Proxmox management node
+  - host: "10.0.101.2"
+    name: "pve-mgmt"
+    type: "infrastructure"
+    network: "Proxmox Management"
+    ports: [22, 8006, 3128, 5900]
+    services:
+      - port: 8006
+        service: "proxmox-ve"
+        version: "8.x"
+      - port: 3128
+        service: "spiceproxy"
+    credentials:
+      - username: "root@pam"
+        password_env: "PVE_ROOT_PASS"
+        access_level: "admin"
+    tags: ["hypervisor", "cluster-master", "critical"]
+    modules: ["proxmox_ve"]
+
+  # Cluster node 01
+  - host: "10.0.102.2"
+    name: "pve-node-01"
+    type: "infrastructure"
+    network: "VM Network"
+    ports: [22, 8006, 3128]
+    services:
+      - port: 8006
+        service: "proxmox-ve"
+        version: "8.x"
+    tags: ["hypervisor", "cluster-member", "critical"]
+    modules: ["proxmox_ve"]
+
+  # Cluster node 02
+  - host: "10.0.102.3"
+    name: "pve-node-02"
+    type: "infrastructure"
+    network: "VM Network"
+    ports: [22, 8006, 3128]
+    services:
+      - port: 8006
+        service: "proxmox-ve"
+        version: "8.x"
+    tags: ["hypervisor", "cluster-member", "critical"]
+    modules: ["proxmox_ve"]
+
+  # Cluster node 03
+  - host: "10.0.102.4"
+    name: "pve-node-03"
+    type: "infrastructure"
+    network: "VM Network"
+    ports: [22, 8006, 3128]
+    services:
+      - port: 8006
+        service: "proxmox-ve"
+        version: "8.x"
+    tags: ["hypervisor", "cluster-member", "critical"]
+    modules: ["proxmox_ve"]
+
+exclusions:
+  hosts:
+    - "10.0.101.1"   # Gateway
+    - "10.0.101.254" # Reserved
+  cidrs:
+    - "10.0.103.0/24"  # Storage network - exclude from active testing
+  ports:
+    - 111   # RPC portmapper
+    - 2049  # NFS
+    - 6789  # Ceph MON
+    - 6800  # Ceph OSD
+
+# Proxmox-specific test focus areas
+test_focus:
+  - "API authentication bypass"
+  - "Privilege escalation (user to admin)"
+  - "VM escape vectors"
+  - "Container (LXC) escape"
+  - "Cluster authentication (corosync)"
+  - "Default credentials"
+  - "Known CVEs (CVE-2022-35508, etc.)"
+  - "Backup access controls"
+  - "Storage permission misconfigurations"
