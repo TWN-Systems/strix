@@ -1,0 +1,149 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<tools>
+  <tool name="create_script">
+    <description>Create or update a custom script for deterministic execution</description>
+    <details>
+      Use this to create reusable scripts for common operations like nmap scans,
+      directory enumeration, or custom exploitation scripts. These scripts run
+      faster and more reliably than generative approaches because they are
+      deterministic - same inputs always produce same outputs.
+
+      Benefits:
+      - Efficiency: No LLM overhead for routine scans
+      - Determinism: Reproducible results
+      - Reusability: Scripts persist across sessions
+      - Auditability: Clear record of what was executed
+
+      The script will be saved and can be executed later with execute_script.
+    </details>
+    <parameters>
+      <parameter name="name" type="string" required="true">
+        <description>Unique script name (alphanumeric and underscores only)</description>
+      </parameter>
+      <parameter name="content" type="string" required="true">
+        <description>The script content (bash, python, etc.). Use $1, $2 for positional parameters or environment variables STRIX_PARAM_*</description>
+      </parameter>
+      <parameter name="description" type="string" required="true">
+        <description>Human-readable description of what the script does</description>
+      </parameter>
+      <parameter name="category" type="string" required="false">
+        <description>Script category: reconnaissance, scanning, exploitation, post_exploitation, reporting, utility, validation</description>
+      </parameter>
+      <parameter name="language" type="string" required="false">
+        <description>Script language: bash, python, ruby, perl, powershell (default: bash)</description>
+      </parameter>
+      <parameter name="parameters" type="string" required="false">
+        <description>JSON list of parameter names, e.g., '["target", "port"]'</description>
+      </parameter>
+      <parameter name="parameter_descriptions" type="string" required="false">
+        <description>JSON object of param descriptions, e.g., '{"target": "IP or hostname"}'</description>
+      </parameter>
+      <parameter name="tags" type="string" required="false">
+        <description>JSON list of tags for searching, e.g., '["nmap", "ports"]'</description>
+      </parameter>
+      <parameter name="timeout" type="integer" required="false">
+        <description>Execution timeout in seconds (default: 300)</description>
+      </parameter>
+    </parameters>
+    <returns type="Dict[str, Any]">
+      <description>Dictionary with script metadata on success, or error message</description>
+    </returns>
+    <examples>
+      <function=create_script>
+      <parameter=name>nmap_custom_scan</parameter>
+      <parameter=content>#!/bin/bash
+# Custom nmap scan with specific options
+TARGET="$1"
+nmap -sV -sC -p 80,443,8080,8443 -oN /tmp/scan_$$.txt "$TARGET"
+cat /tmp/scan_$$.txt</parameter>
+      <parameter=description>Custom nmap scan for common web ports</parameter>
+      <parameter=category>reconnaissance</parameter>
+      <parameter=parameters>["target"]</parameter>
+      <parameter=tags>["nmap", "web", "ports"]</parameter>
+      </function>
+    </examples>
+  </tool>
+
+  <tool name="execute_script">
+    <description>Execute a registered script with the given parameters</description>
+    <details>
+      This executes scripts created with create_script in a deterministic manner.
+      Much faster and more reliable than generative AI execution for routine tasks.
+
+      The script runs in the sandbox environment with the specified parameters.
+      Parameters are passed as positional arguments and as environment variables
+      (STRIX_PARAM_TARGET, STRIX_PARAM_PORT, etc.).
+
+      Built-in scripts available:
+      - nmap_quick_scan: Quick scan of top 1000 ports
+      - nmap_full_scan: Full port scan with scripts
+      - nmap_vuln_scan: Vulnerability scanning
+      - nikto_scan: Web vulnerability scan
+      - gobuster_dir: Directory enumeration
+      - whatweb_scan: Technology fingerprinting
+      - ffuf_fuzz: Web fuzzing
+    </details>
+    <parameters>
+      <parameter name="name" type="string" required="true">
+        <description>Name of the script to execute</description>
+      </parameter>
+      <parameter name="parameters" type="string" required="false">
+        <description>JSON object of parameter values, e.g., '{"target": "192.168.1.1", "port": "80"}'</description>
+      </parameter>
+    </parameters>
+    <returns type="Dict[str, Any]">
+      <description>Dictionary with execution result including stdout, stderr, exit code, and duration</description>
+    </returns>
+    <examples>
+      <function=execute_script>
+      <parameter=name>nmap_quick_scan</parameter>
+      <parameter=parameters>{"target": "192.168.1.1"}</parameter>
+      </function>
+    </examples>
+  </tool>
+
+  <tool name="list_scripts">
+    <description>List registered scripts, optionally filtered by category or tags</description>
+    <details>
+      Returns a list of all registered scripts with their metadata.
+      Can filter by category or tags to find relevant scripts.
+    </details>
+    <parameters>
+      <parameter name="category" type="string" required="false">
+        <description>Filter by category: reconnaissance, scanning, exploitation, post_exploitation, reporting, utility, validation</description>
+      </parameter>
+      <parameter name="tags" type="string" required="false">
+        <description>JSON list of tags to filter by (any match), e.g., '["nmap", "ports"]'</description>
+      </parameter>
+    </parameters>
+    <returns type="Dict[str, Any]">
+      <description>Dictionary with list of script metadata</description>
+    </returns>
+    <examples>
+      <function=list_scripts>
+      <parameter=category>reconnaissance</parameter>
+      </function>
+    </examples>
+  </tool>
+
+  <tool name="delete_script">
+    <description>Delete a registered script</description>
+    <details>
+      Permanently removes a script from the registry.
+      Use with caution - this cannot be undone.
+    </details>
+    <parameters>
+      <parameter name="name" type="string" required="true">
+        <description>Name of the script to delete</description>
+      </parameter>
+    </parameters>
+    <returns type="Dict[str, Any]">
+      <description>Dictionary with success status</description>
+    </returns>
+    <examples>
+      <function=delete_script>
+      <parameter=name>my_old_script</parameter>
+      </function>
+    </examples>
+  </tool>
+</tools>
