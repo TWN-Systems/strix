@@ -61,6 +61,19 @@ xmltodict = "^0.13.0"
 pyte = "^0.8.1"
 requests = "^2.32.0"
 libtmux = "^0.46.2"
+pyyaml = "^6.0.0"
+
+# Optional observability integrations
+langfuse = { version = "^2.0.0", optional = true }
+opentelemetry-api = { version = "^1.20.0", optional = true }
+opentelemetry-sdk = { version = "^1.20.0", optional = true }
+opentelemetry-exporter-otlp-proto-grpc = { version = "^1.20.0", optional = true }
+opentelemetry-exporter-otlp-proto-http = { version = "^1.20.0", optional = true }
+
+[tool.poetry.extras]
+langfuse = ["langfuse"]
+opentelemetry = ["opentelemetry-api", "opentelemetry-sdk", "opentelemetry-exporter-otlp-proto-grpc", "opentelemetry-exporter-otlp-proto-http"]
+observability = ["langfuse", "opentelemetry-api", "opentelemetry-sdk", "opentelemetry-exporter-otlp-proto-grpc", "opentelemetry-exporter-otlp-proto-http"]
 
 [tool.poetry.group.dev.dependencies]
 # Type checking and static analysis
@@ -129,6 +142,9 @@ module = [
     "textual.*",
     "pyte.*",
     "libtmux.*",
+    "yaml.*",
+    "langfuse.*",
+    "opentelemetry.*",
 ]
 ignore_missing_imports = true
 

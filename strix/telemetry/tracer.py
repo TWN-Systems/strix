@@ -1,10 +1,26 @@
+"""Strix Tracer - Event-based telemetry system.
+
+This module provides the core tracing infrastructure for Strix, including:
+- Event-based architecture for scan, agent, LLM, tool, and vulnerability tracking
+- JSONL persistence for event streaming
+- Integration with Langfuse and OpenTelemetry for observability
+- Callback system for real-time event processing
+
+The tracer automatically initializes Langfuse and OpenTelemetry callbacks
+if the corresponding environment variables are configured.
+"""
+
+from __future__ import annotations
+
 import json
 import logging
+import os
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from enum import Enum
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Optional
+from typing import TYPE_CHECKING, Any
+
 from uuid import uuid4
 
 
@@ -14,16 +30,62 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-_global_tracer: Optional["Tracer"] = None
+_global_tracer: Tracer | None = None
 
 
-def get_global_tracer() -> Optional["Tracer"]:
+def get_global_tracer() -> Tracer | None:
+    """Get the global tracer instance."""
     return _global_tracer
 
 
-def set_global_tracer(tracer: "Tracer") -> None:
+def set_global_tracer(tracer: Tracer) -> None:
+    """Set the global tracer instance and initialize telemetry integrations."""
     global _global_tracer  # noqa: PLW0603
     _global_tracer = tracer
+
+    # Auto-initialize Langfuse and OpenTelemetry if configured
+    if not os.getenv("STRIX_TELEMETRY_DISABLED", "").lower() == "true":
+        _initialize_telemetry_integrations(tracer)
+
+
+def _initialize_telemetry_integrations(tracer: Tracer) -> None:
+    """Initialize Langfuse and OpenTelemetry integrations if configured.
+
+    This function is called automatically when a tracer is set as global.
+    It checks environment variables and initializes the appropriate integrations.
+
+    Environment Variables:
+        LANGFUSE_PUBLIC_KEY + LANGFUSE_SECRET_KEY: Enable Langfuse
+        OTEL_EXPORTER_OTLP_ENDPOINT: Enable OpenTelemetry
+        STRIX_TELEMETRY_DISABLED: Disable all telemetry integrations
+    """
+    # Initialize Langfuse if configured
+    try:
+        from strix.telemetry.langfuse import create_langfuse_callback
+
+        langfuse_callback = create_langfuse_callback()
+        if langfuse_callback is not None:
+            tracer.add_event_callback(langfuse_callback.handle_event)
+            tracer._langfuse_callback = langfuse_callback  # Store reference for cleanup
+            logger.info("Langfuse telemetry integration enabled")
+    except ImportError:
+        logger.debug("Langfuse not available (langfuse package not installed)")
+    except Exception as e:  # noqa: BLE001
+        logger.warning(f"Failed to initialize Langfuse integration: {e}")
+
+    # Initialize OpenTelemetry if configured
+    try:
+        from strix.telemetry.opentelemetry import create_otel_callback
+
+        otel_callback = create_otel_callback()
+        if otel_callback is not None:
+            tracer.add_event_callback(otel_callback.handle_event)
+            tracer._otel_callback = otel_callback  # Store reference for cleanup
+            logger.info("OpenTelemetry integration enabled")
+    except ImportError:
+        logger.debug("OpenTelemetry not available (opentelemetry packages not installed)")
+    except Exception as e:  # noqa: BLE001
+        logger.warning(f"Failed to initialize OpenTelemetry integration: {e}")
 
 
 class EventType(str, Enum):
@@ -628,4 +690,14 @@ class Tracer:
         }
 
     def cleanup(self) -> None:
+        """Cleanup tracer resources and flush telemetry data."""
         self.save_run_data(mark_complete=True)
+
+        # Flush and shutdown Langfuse if initialized
+        if hasattr(self, "_langfuse_callback") and self._langfuse_callback:
+            try:
+                self._langfuse_callback.flush()
+                self._langfuse_callback.shutdown()
+                logger.info("Langfuse telemetry flushed and shutdown")
+            except Exception as e:  # noqa: BLE001
+                logger.warning(f"Error shutting down Langfuse: {e}")

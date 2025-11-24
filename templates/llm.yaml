@@ -1,0 +1,78 @@
+# LLM Roles Configuration Example
+# Copy this file to ./llm.yaml and customize for your setup
+
+#──────────────────────────────────────────────────────────────────────
+# LLM ROLES
+#──────────────────────────────────────────────────────────────────────
+# Define different model configurations for various tasks.
+# Each role can use a different provider/model optimized for its purpose.
+
+llm:
+  roles:
+    # Primary: Main agent loop - balanced performance and cost
+    primary:
+      provider: anthropic
+      model: claude-sonnet-4-20250514
+      # api_key: ${ANTHROPIC_API_KEY}  # Reads from environment variable
+
+    # Fast: Quick operations - low latency, lower cost
+    fast:
+      provider: google
+      model: gemini-2.0-flash
+      max_tokens: 1000
+      # api_key: ${GOOGLE_API_KEY}
+
+    # Local: Cost-free, offline via Ollama
+    local:
+      provider: ollama
+      model: llama3.1
+      base_url: ${OLLAMA_BASE_URL:-http://localhost:11434}
+      fallback_to: fast  # Fall back to fast model if local unavailable
+
+    # Thinking: Complex reasoning - deep analysis
+    thinking:
+      provider: google
+      model: gemini-3.0-pro
+      # api_key: ${GOOGLE_API_KEY}
+
+    # Coding: Code analysis - code-optimized
+    coding:
+      provider: anthropic
+      model: claude-sonnet-4-20250514
+      # api_key: ${ANTHROPIC_API_KEY}
+
+    # Validation: Cross-check findings - different model family
+    validation:
+      provider: openai
+      model: gpt-5-turbo
+      # api_key: ${OPENAI_API_KEY}
+
+  #──────────────────────────────────────────────────────────────────────
+  # TASK ROUTING
+  #──────────────────────────────────────────────────────────────────────
+  # Map task types to roles. This allows automatic model selection
+  # based on what the agent is doing.
+
+  routing:
+    default: primary           # Default role for unspecified tasks
+    planning: thinking         # Use thinking model for complex planning
+    reconnaissance: primary    # Primary for recon operations
+    exploitation: coding       # Coding model for exploit development
+    reporting: fast            # Fast model for report generation
+    vuln_analysis: thinking    # Deep analysis for vulnerability assessment
+    code_review: coding        # Code-optimized for code review
+    finding_validation: validation  # Different family for cross-validation
+
+  #──────────────────────────────────────────────────────────────────────
+  # COST OPTIMIZATION
+  #──────────────────────────────────────────────────────────────────────
+
+  cost:
+    # Prefer local models when available (cheaper)
+    prefer_local: false
+
+    # Timeout for local model requests before falling back
+    local_timeout_seconds: 30
+
+    # Use fast model for requests under this token count
+    fast_threshold_tokens: 500
