@@ -35,9 +35,6 @@ from strix.runtime.docker_runtime import STRIX_IMAGE
 from strix.telemetry.tracer import get_global_tracer
 
 
-logging.getLogger().setLevel(logging.ERROR)
-
-
 def validate_environment() -> None:  # noqa: PLR0912, PLR0915
     console = Console()
     missing_required_vars = []
@@ -313,6 +310,19 @@ Examples:
         ),
     )
 
+    parser.add_argument(
+        "-v",
+        "--verbose",
+        action="count",
+        default=0,
+        help="Increase verbosity (-v: WARNING, -vv: INFO, -vvv: DEBUG).",
+    )
+    parser.add_argument(
+        "--debug",
+        action="store_true",
+        help="Enable full debug output (equivalent to -vvv).",
+    )
+
     args = parser.parse_args()
 
     if args.instruction:
@@ -472,6 +482,24 @@ def main() -> None:
 
     if not args.run_name:
         args.run_name = generate_run_name(args.targets_info)
+
+    # Configure logging based on verbosity
+    verbosity = 3 if args.debug else args.verbose
+    log_level = [logging.ERROR, logging.WARNING, logging.INFO, logging.DEBUG][min(verbosity, 3)]
+    logging.basicConfig(
+        level=log_level,
+        format="%(asctime)s %(name)s %(levelname)s %(message)s",
+        force=True,
+    )
+    if verbosity > 0:
+        log_dir = Path("strix_runs") / args.run_name
+        log_dir.mkdir(parents=True, exist_ok=True)
+        fh = logging.FileHandler(log_dir / "debug.log")
+        fh.setLevel(log_level)
+        fh.setFormatter(logging.Formatter("%(asctime)s %(name)s %(levelname)s %(message)s"))
+        logging.getLogger().addHandler(fh)
+    if verbosity >= 3:
+        litellm._logging._enable_debugging()  # type: ignore[no-untyped-call]
 
     for target_info in args.targets_info:
         if target_info["type"] == "repository":
